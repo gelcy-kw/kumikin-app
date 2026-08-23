@@ -146,15 +146,28 @@ if check_password():
                 count = converted_day_tasks.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == count)
 
-        # ハード制約3: 連続ペアタスク制約
+        # ハード制約3: 連続ペアタスク制約（アプローチA：翌日のDayTypeに合わせて自動動的変換）
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
+            next_d_type = day_type_map.get(d_next, 'Weekday') # 翌日の DayType
+            
             for t_id, t_info in tasks_master.items():
-                pair_id = str(t_info.get('PairTaskID', '')).strip()
-                if pair_id and pair_id != 'nan' and pair_id in tasks_master:
-                    for p in existing_members:
-                        model.Add(x[p, d_curr, t_id] == x[p, d_next, pair_id])
+                pair_raw = str(t_info.get('PairTaskID', '')).strip()
+                if pair_raw and pair_raw != 'nan':
+                    # 枝番（_W, _H）が付いていてもいなくても表示用IDを取得
+                    pair_disp = pair_raw.split('_')[0]
+                    
+                    # 翌日の DayType に合わせて適切な内部 TaskID を特定する
+                    resolved_pair_id = disp_to_internal.get(
+                        (pair_disp, next_d_type), 
+                        disp_to_internal.get((pair_disp, 'All'), pair_raw)
+                    )
+                    
+                    if resolved_pair_id in tasks_master:
+                        for p in existing_members:
+                            # 本日 t_id をやるなら、翌日は自動解決された resolved_pair_id を割り当てる
+                            model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
         # 目的関数（ペナルティ項の最小化）
         penalty_terms = []
