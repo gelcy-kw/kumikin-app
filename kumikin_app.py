@@ -22,7 +22,7 @@ def check_password():
 
 if check_password():
     st.title("Task Schedule Optimizer")
-    st.caption("Resource Allocation & Constraint Solver (DayType Supported)")
+    st.caption("Resource Allocation & Constraint Solver (OFF Lock Supported)")
 
     st.subheader("1. Load Data Files")
     file_members = st.file_uploader("Member_Master.csv", type=["csv"])
@@ -54,11 +54,8 @@ if check_password():
 
         # 縦書き(行:日付, 列:人員)構造を作成
         df_initial_indexed = df_members_sched.set_index(header_col)
-        
-        # 列名（日付）の空白除去
         df_initial_indexed.columns = [str(c).strip() for c in df_initial_indexed.columns]
         
-        # 行（メンバー）の順序を Member_Master と一致させる
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
             st.error("Initial_Schedule.csv のメンバーIDが Member_Master と一致しません。")
@@ -102,7 +99,7 @@ if check_password():
             for d in days:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
                 
-        # ハード制約2: 日別タスク割り当て数の維持 ＆ 固定日(Fixed)の適用
+        # ハード制約2: 日別タスク割り当て数の維持 ＆ OFFおよびFixed(固定日)のロック適用
         for d in days:
             d_type = day_type_map.get(d, 'Weekday')
             day_row = df_initial_shift[df_initial_shift['Date'] == d]
@@ -118,7 +115,12 @@ if check_password():
                 internal_t = disp_to_internal.get((raw_t, d_type), disp_to_internal.get((raw_t, 'All'), raw_t))
                 converted_day_tasks.append(internal_t)
                 
-                # Fixed (トレード対象外) の日なら初期配置のまま固定
+                # 【新規改修】OFF のセルは絶対に移動しないように固定（ロック）！
+                if raw_t == 'OFF' or internal_t == 'OFF':
+                    if 'OFF' in all_tasks:
+                        model.Add(x[p, d, 'OFF'] == 1)
+
+                # Fixed (トレード対象外の日) なら初期配置のまま固定
                 if d_type == 'Fixed':
                     if internal_t in all_tasks:
                         model.Add(x[p, d, internal_t] == 1)
@@ -183,7 +185,6 @@ if check_password():
                 for p in existing_members:
                     for t in all_tasks:
                         if solver.Value(x[p, d, t]) == 1:
-                            # 内部ID (101_W) を 表示用ID (101) に変換して出力
                             row[p] = internal_to_disp.get(t, t)
                             break
                 result_rows.append(row)
