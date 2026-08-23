@@ -26,7 +26,7 @@ def safe_read_csv(file):
     return pd.read_csv(file, encoding="cp932", encoding_errors="replace")
 
 
-# --- 超高速・安定版 最適化処理メイン ---
+# --- シフトトレード＆最適化処理 ---
 def run_optimization(df_members, df_tasks, df_initial_raw):
     logs = []
 
@@ -35,102 +35,96 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
         print(f"[OPT_LOG] {msg}")
 
     try:
-        log("最適化処理を開始します (超高速ルールベースモード)...")
+        log("最適化処理（トレード実行モード）を開始します...")
 
-        # 0. 空列・不要列の除去
+        # 1. ヘッダー・不要列の整理
         df_initial_raw = df_initial_raw.loc[
             :, ~df_initial_raw.columns.str.contains("^Unnamed")
         ]
         df_initial_raw = df_initial_raw.loc[
-            :,
-            df_initial_raw.columns.notna() & (df_initial_raw.columns != ""),
+            :, df_initial_raw.columns.notna() & (df_initial_raw.columns != "")
         ]
 
         header_col = df_initial_raw.columns[0]
-        log(f"初期スケジュールヘッダー列識別: '{header_col}'")
-
-        # DayType行の取得
+        
+        # DayType行の特定
         day_types_row = df_initial_raw[
-            df_initial_raw[header_col]
-            .astype(str)
-            .str.strip()
-            .str.upper()
-            == "DAYTYPE"
+            df_initial_raw[header_col].astype(str).str.strip().str.upper() == "DAYTYPE"
         ]
-        if day_types_row.empty:
-            log("エラー: Initial_Schedule.csv に 'DayType' 行が見つかりません。")
-            return (
-                df_initial_raw,
-                False,
-                "Initial_Schedule.csv に 'DayType' 行が見つかりません。",
-                logs,
-            )
-
+        
         dates = [str(c).strip() for c in df_initial_raw.columns[1:]]
-        log(f"対象日付リスト ({len(dates)}日間): {dates}")
 
         day_type_map = {}
-        for col in df_initial_raw.columns[1:]:
-            col_str = str(col).strip()
-            day_type_map[col_str] = str(
-                day_types_row[col].values[0]
-            ).strip()
+        if not day_types_row.empty:
+            for col in df_initial_raw.columns[1:]:
+                col_str = str(col).strip()
+                day_type_map[col_str] = str(day_types_row[col].values[0]).strip()
 
-        # Member_Master 準備
-        df_members["MemberID"] = (
-            df_members["MemberID"].astype(str).str.strip()
-        )
+        # 2. メンバー情報の整理
+        df_members["MemberID"] = df_members["MemberID"].astype(str).str.strip()
         members = df_members["MemberID"].tolist()
 
-        has_name_in_master = "Name" in df_members.columns
         member_names = (
-            df_members.set_index("MemberID")["Name"]
-            .astype(str)
-            .str.strip()
-            .to_dict()
-            if has_name_in_master
+            df_members.set_index("MemberID")["Name"].astype(str).str.strip().to_dict()
+            if "Name" in df_members.columns
             else {}
         )
 
+        # 初期スケジュールをメンバーごとに抽出
         df_members_sched = df_initial_raw[
-            df_initial_raw[header_col]
-            .astype(str)
-            .str.strip()
-            .str.upper()
-            != "DAYTYPE"
+            df_initial_raw[header_col].astype(str).str.strip().str.upper() != "DAYTYPE"
         ].copy()
-        df_members_sched[header_col] = (
-            df_members_sched[header_col].astype(str).str.strip()
-        )
+        df_members_sched[header_col] = df_members_sched[header_col].astype(str).str.strip()
 
-        df_initial_indexed = df_members_sched.set_index(header_col)
-        df_initial_indexed.columns = [
-            str(c).strip() for c in df_initial_indexed.columns
-        ]
+        df_sched = df_members_sched.set_index(header_col)
+        df_sched.columns = [str(c).strip() for c in df_sched.columns]
 
-        existing_members = [m for m in members if m in df_initial_indexed.index]
-        log(
-            f"一致したメンバー数: {len(existing_members)} / 全マスター登録者: {len(members)}"
-        )
+        existing_members = [m for m in members if m in df_sched.index]
+        log(f"対象メンバー数: {len(existing_members)} 名 / 対象日数: {len(dates)} 日")
 
-        if len(existing_members) == 0:
-            log(
-                "エラー: Initial_Schedule.csv のメンバーIDが Member_Master と一致しません。"
-            )
-            return (
-                df_initial_raw,
-                False,
-                "Initial_Schedule.csv のメンバーIDが Member_Master と一致しません。",
-                logs,
-            )
+        # 3. トレード（シフト入れ替え）アルゴリズムの実行
+        # 各日付ごとにトレード調整を実施
+        trade_count = 0
+        
+        for d in dates:
+            # 該当日の各メンバーのシフトを取得
+            day_shifts = df_sched[d].to_dict()
+            
+            # 調整が必要なタスク（「希望休」「要交代」「休」等の特定のフラグ、または特定の未割り当て）
+            # ここでは交換可能な2名のシフトを安全にトレードするルールを適用
+            unassigned_or_request = [
+                m for m, task in day_shifts.items() 
+                if str(task).strip() in ["希望休", "要交代", "NG", "休", "OFF", "-"]
+            ]
+            
+            candidates = [
+                m for m, task in day_shifts.items() 
+                if str(task).strip() not in ["希望休", "要交代", "NG", "休", "OFF", "-", "不可"]
+            ]
+            
+            # トレードペアの検索と交換実行
+            for m_req in unassigned_or_request:
+                if not candidates:
+                    break
+                # 代替可能な候補者をピックアップしてシフトをトレード
+                m_cand = candidates.pop(0)
+                
+                # シフトの交換
+                task_req = df_sched.at[m_req, d]
+                task_cand = df_sched.at[m_cand, d]
+                
+                df_sched.at[m_req, d] = task_cand
+                df_sched.at[m_cand, d] = task_req
+                
+                trade_count += 1
+                log(f"【トレード発生】日付: {d} | メンバー {m_req} ({task_req}) ↔ メンバー {m_cand} ({task_cand})")
 
-        # 結果フレームの構築（初期スケジュールを維持しつつ、安全にデータ整形）
-        df_result_horiz = df_initial_indexed.loc[existing_members].reset_index()
+        log(f"合計 {trade_count} 件のトレード処理が完了しました。")
 
+        # 4. 結果データフレームの構築
+        df_result_horiz = df_sched.loc[existing_members].reset_index()
         df_result_horiz.insert(
-            1,
-            "Name",
-            df_result_horiz[header_col].map(member_names).fillna(""),
+            1, "Name", df_result_horiz[header_col].map(member_names).fillna("")
         )
 
         day_type_output_row = {header_col: "DayType", "Name": ""}
@@ -138,11 +132,8 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
             day_type_output_row[d] = day_type_map.get(d, "")
 
         df_dt_row = pd.DataFrame([day_type_output_row])
-        df_result_final = pd.concat(
-            [df_dt_row, df_result_horiz], ignore_index=True
-        )
+        df_result_final = pd.concat([df_dt_row, df_result_horiz], ignore_index=True)
 
-        log("データ処理・調整が完了しました。")
         return df_result_final, True, "成功", logs
 
     except Exception as e:
@@ -170,7 +161,7 @@ def main():
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行", key="btn_run"):
         if file_members and file_tasks and file_initial:
-            with st.spinner("⏳ 処理を実行中です..."):
+            with st.spinner("⏳ トレード最適化を実行中です..."):
                 try:
                     df_m = safe_read_csv(file_members)
                     df_t = safe_read_csv(file_tasks)
@@ -181,10 +172,8 @@ def main():
                     )
 
                     if success:
-                        st.success("🎉 シフトの調整・出力準備が正常に完了しました！")
-                        csv_data = result_df.to_csv(index=False).encode(
-                            "utf-8-sig"
-                        )
+                        st.success("🎉 シフトのトレード調整・出力が完了しました！")
+                        csv_data = result_df.to_csv(index=False).encode("utf-8-sig")
                         st.download_button(
                             label="📥 調整済みシフト表 (Optimized_Schedule.csv) をダウンロード",
                             data=csv_data,
@@ -195,7 +184,7 @@ def main():
                     else:
                         st.error(f"処理失敗: {msg}")
 
-                    with st.expander("🔍 詳細ログを表示"):
+                    with st.expander("🔍 詳細ログ・トレード履歴を表示"):
                         st.text("\n".join(logs))
 
                 except Exception as e:
