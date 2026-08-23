@@ -3,9 +3,29 @@ import sys
 import traceback
 import pandas as pd
 import streamlit as st
+from ortools.sat.python import cp_model
 
 # ページ基本設定
 st.set_page_config(page_title="勤務変更補助システム", layout="centered")
+
+
+# --- アクセス制限機能 ---
+def check_password():
+    """暗証番号によるアクセス制限"""
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+
+    if not st.session_state["password_correct"]:
+        st.title("🔒 アクセス制限")
+        pwd = st.text_input("パスコードを入力してください", type="password")
+        if st.button("ログイン"):
+            if pwd == "1026":  # パスコード
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("パスコードが正しくありません")
+        return False
+    return True
 
 
 # --- CSV安全読み込み関数 ---
@@ -26,7 +46,7 @@ def safe_read_csv(file):
     return pd.read_csv(file, encoding="cp932", encoding_errors="replace")
 
 
-# --- シフトトレード＆最適化処理 ---
+# --- メインロジック (CpModel最適化ソルバー) ---
 def run_optimization(df_members, df_tasks, df_initial_raw):
     logs = []
 
@@ -35,9 +55,9 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
         print(f"[OPT_LOG] {msg}")
 
     try:
-        log("最適化処理（トレード実行モード）を開始します...")
+        log("ORTools CP-SAT ソルバーによる最適化計算を開始します...")
 
-        # 1. ヘッダー・不要列の整理
+        # 1. 不要な Unnamed 列や空列の除外
         df_initial_raw = df_initial_raw.loc[
             :, ~df_initial_raw.columns.str.contains("^Unnamed")
         ]
@@ -46,95 +66,303 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
         ]
 
         header_col = df_initial_raw.columns[0]
-        
-        # DayType行の特定
+
+        # DayType行の取得
         day_types_row = df_initial_raw[
             df_initial_raw[header_col].astype(str).str.strip().str.upper() == "DAYTYPE"
         ]
-        
+        if day_types_row.empty:
+            return df_initial_raw, False, "Initial_Schedule.csv に 'DayType' 行が見つかりません。", logs
+
+        # 日付ごとの DayType マッピング
         dates = [str(c).strip() for c in df_initial_raw.columns[1:]]
-
         day_type_map = {}
-        if not day_types_row.empty:
-            for col in df_initial_raw.columns[1:]:
-                col_str = str(col).strip()
-                day_type_map[col_str] = str(day_types_row[col].values[0]).strip()
+        for col in df_initial_raw.columns[1:]:
+            col_str = str(col).strip()
+            day_type_map[col_str] = str(day_types_row[col].values[0]).strip()
 
-        # 2. メンバー情報の整理
+        # Member_Master の準備（MemberID, Name, BaseArea, Role, Gender）
         df_members["MemberID"] = df_members["MemberID"].astype(str).str.strip()
         members = df_members["MemberID"].tolist()
 
-        member_names = (
-            df_members.set_index("MemberID")["Name"].astype(str).str.strip().to_dict()
-            if "Name" in df_members.columns
+        member_home = (
+            df_members.set_index("MemberID")["BaseArea"].astype(str).str.strip().to_dict()
+            if "BaseArea" in df_members.columns
             else {}
         )
 
-        # 初期スケジュールをメンバーごとに抽出
+        has_name = "Name" in df_members.columns
+        member_names = df_members.set_index("MemberID")["Name"].to_dict() if has_name else {}
+
+        if "Role" in df_members.columns:
+            member_role = (
+                df_members.set_index("MemberID")["Role"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .to_dict()
+            )
+        else:
+            member_role = {m: "MC" for m in members}
+
+        if "Gender" in df_members.columns:
+            member_gender = (
+                df_members.set_index("MemberID")["Gender"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .to_dict()
+            )
+        else:
+            member_gender = {m: "M" for m in members}
+
+        # メンバー行の抽出
         df_members_sched = df_initial_raw[
             df_initial_raw[header_col].astype(str).str.strip().str.upper() != "DAYTYPE"
         ].copy()
         df_members_sched[header_col] = df_members_sched[header_col].astype(str).str.strip()
 
-        df_sched = df_members_sched.set_index(header_col)
-        df_sched.columns = [str(c).strip() for c in df_sched.columns]
+        df_initial_indexed = df_members_sched.set_index(header_col)
+        df_initial_indexed.columns = [str(c).strip() for c in df_initial_indexed.columns]
 
-        existing_members = [m for m in members if m in df_sched.index]
-        log(f"対象メンバー数: {len(existing_members)} 名 / 対象日数: {len(dates)} 日")
+        existing_members = [m for m in members if m in df_initial_indexed.index]
+        if len(existing_members) == 0:
+            return (
+                df_initial_raw,
+                False,
+                "Initial_Schedule.csv のメンバーIDが Member_Master と一致しません。",
+                logs,
+            )
 
-        # 3. トレード（シフト入れ替え）アルゴリズムの実行
-        # 各日付ごとにトレード調整を実施
-        trade_count = 0
-        
-        for d in dates:
-            # 該当日の各メンバーのシフトを取得
-            day_shifts = df_sched[d].to_dict()
-            
-            # 調整が必要なタスク（「希望休」「要交代」「休」等の特定のフラグ、または特定の未割り当て）
-            # ここでは交換可能な2名のシフトを安全にトレードするルールを適用
-            unassigned_or_request = [
-                m for m, task in day_shifts.items() 
-                if str(task).strip() in ["希望休", "要交代", "NG", "休", "OFF", "-"]
-            ]
-            
-            candidates = [
-                m for m, task in day_shifts.items() 
-                if str(task).strip() not in ["希望休", "要交代", "NG", "休", "OFF", "-", "不可"]
-            ]
-            
-            # トレードペアの検索と交換実行
-            for m_req in unassigned_or_request:
-                if not candidates:
-                    break
-                # 代替可能な候補者をピックアップしてシフトをトレード
-                m_cand = candidates.pop(0)
-                
-                # シフトの交換
-                task_req = df_sched.at[m_req, d]
-                task_cand = df_sched.at[m_cand, d]
-                
-                df_sched.at[m_req, d] = task_cand
-                df_sched.at[m_cand, d] = task_req
-                
-                trade_count += 1
-                log(f"【トレード発生】日付: {d} | メンバー {m_req} ({task_req}) ↔ メンバー {m_cand} ({task_cand})")
+        df_initial_indexed = df_initial_indexed.loc[existing_members]
 
-        log(f"合計 {trade_count} 件のトレード処理が完了しました。")
+        # (行: Date, 列: MemberID) 形式に転置
+        df_initial_shift = df_initial_indexed.T
+        df_initial_shift.index = [str(idx).strip() for idx in df_initial_shift.index]
+        df_initial_shift = df_initial_shift.reset_index().rename(columns={"index": "Date"})
 
-        # 4. 結果データフレームの構築
-        df_result_horiz = df_sched.loc[existing_members].reset_index()
-        df_result_horiz.insert(
-            1, "Name", df_result_horiz[header_col].map(member_names).fillna("")
+        # モデル作成
+        model = cp_model.CpModel()
+        days = dates
+
+        # タスクマスターの準備
+        df_tasks["TaskID"] = df_tasks["TaskID"].astype(str).str.strip().str.upper()
+        tasks_master = df_tasks.set_index("TaskID").to_dict("index")
+        all_tasks = list(tasks_master.keys())
+
+        # IDマッピングの構築
+        disp_to_internal = {}
+        internal_to_disp = {}
+        for t_id, t_info in tasks_master.items():
+            clean_id = t_id
+            if clean_id.startswith("M_") or clean_id.startswith("C_"):
+                clean_id = clean_id[2:]
+            disp_no = clean_id.split("_")[0] if "_" in clean_id else clean_id
+
+            d_type = str(t_info.get("DayType", "All")).strip()
+            disp_to_internal[(disp_no.upper(), d_type)] = t_id
+            disp_to_internal[(disp_no.upper(), "All")] = t_id
+            internal_to_disp[t_id] = disp_no
+
+        # 特殊仕業（絶対固定対象）の定義
+        SPECIAL_DUTIES = (
+            [f"A{i}" for i in range(1, 8)]
+            + [f"J{i}" for i in range(1, 7)]
+            + [f"R{i}" for i in range(1, 7)]
+            + [f"S{i}" for i in range(1, 4)]
         )
 
-        day_type_output_row = {header_col: "DayType", "Name": ""}
-        for d in dates:
-            day_type_output_row[d] = day_type_map.get(d, "")
+        # 決定変数: x[p, d, t]
+        x = {}
+        for p in existing_members:
+            for d in days:
+                for t in all_tasks:
+                    x[p, d, t] = model.NewBoolVar(f"x_{p}_{d}_{t}")
 
-        df_dt_row = pd.DataFrame([day_type_output_row])
-        df_result_final = pd.concat([df_dt_row, df_result_horiz], ignore_index=True)
+        # 【ハード制約1】1人1日1タスク
+        for p in existing_members:
+            for d in days:
+                model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        return df_result_final, True, "成功", logs
+        # 【ハード制約1.5】資格 (Role) ミスマッチの禁止
+        for p in existing_members:
+            p_role = member_role.get(p, "MC")
+            for t_id, t_info in tasks_master.items():
+                t_role = str(t_info.get("Role", "All")).strip().upper()
+                if p_role == "M" and t_role == "C":
+                    for d in days:
+                        model.Add(x[p, d, t_id] == 0)
+                elif p_role == "C" and t_role == "M":
+                    for d in days:
+                        model.Add(x[p, d, t_id] == 0)
+
+        # 【ハード制約1.6】女性用宿泊設備なし仕業の割り当て禁止 (FemaleAllowed == 'N')
+        for p in existing_members:
+            p_gender = member_gender.get(p, "M")
+            if p_gender == "F":
+                for t_id, t_info in tasks_master.items():
+                    female_ok = str(t_info.get("FemaleAllowed", "Y")).strip().upper()
+                    if female_ok == "N":
+                        for d in days:
+                            model.Add(x[p, d, t_id] == 0)
+
+        # 【ハード制約2】日別タスク割り当て数の維持 ＆ 特殊仕業・OFF・Fixed(固定日)のロック
+        for d in days:
+            d_type = day_type_map.get(d, "Weekday")
+            day_row = df_initial_shift[df_initial_shift["Date"] == d]
+
+            converted_day_tasks = []
+            for p in existing_members:
+                if not day_row.empty and p in day_row.columns:
+                    raw_t = str(day_row[p].values[0]).strip().upper()
+                else:
+                    raw_t = "OFF"
+
+                # 内部IDの取得
+                internal_t = disp_to_internal.get(
+                    (raw_t, d_type), disp_to_internal.get((raw_t, "All"), raw_t)
+                )
+                converted_day_tasks.append(internal_t)
+
+                # 1. OFF のセルは絶対移動しないように完全固定（ロック）
+                if raw_t == "OFF" or internal_t == "OFF":
+                    if "OFF" in all_tasks:
+                        model.Add(x[p, d, "OFF"] == 1)
+
+                # 2. 特殊仕業の固定（ロック）
+                elif raw_t in SPECIAL_DUTIES:
+                    if internal_t in all_tasks:
+                        model.Add(x[p, d, internal_t] == 1)
+
+                # 3. Fixed (トレード対象外の日) なら初期配置のまま固定
+                elif d_type == "Fixed":
+                    if internal_t in all_tasks:
+                        model.Add(x[p, d, internal_t] == 1)
+
+            # タスク総数の維持
+            for t in all_tasks:
+                count = converted_day_tasks.count(t)
+                model.Add(sum(x[p, d, t] for p in existing_members) == count)
+
+        # 【ハード制約3】連続ペアタスク制約 (泊まり仕業を絶対分離させない)
+        for d_idx in range(len(days) - 1):
+            d_curr = days[d_idx]
+            d_next = days[d_idx + 1]
+            next_d_type = day_type_map.get(d_next, "Weekday")
+
+            for t_id, t_info in tasks_master.items():
+                pair_raw = str(t_info.get("PairTaskID", "")).strip().upper()
+                if pair_raw and pair_raw not in ["NAN", "", "NONE"]:
+                    pair_disp = pair_raw.split("_")[0]
+                    resolved_pair_id = disp_to_internal.get(
+                        (pair_disp, next_d_type),
+                        disp_to_internal.get((pair_disp, "All"), pair_raw),
+                    )
+
+                    if resolved_pair_id in tasks_master:
+                        for p in existing_members:
+                            # 1日目の仕業に入ったら、2日目は必ずペア仕業に入る（分離不可能）
+                            model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
+
+        # 【目的関数】ペナルティの最小化
+        penalty_terms = []
+
+        # 優先順位 1: 拠点ミスマッチペナルティ（通勤コスト最優先） [重み: 1,000,000]
+        for p in existing_members:
+            home_st = member_home.get(p, "")
+            for d in days:
+                for t_id, t_info in tasks_master.items():
+                    target_area = str(t_info.get("TargetArea", "")).strip().upper()
+                    if target_area and target_area != "NAN":
+                        if target_area != str(home_st).strip().upper():
+                            penalty_terms.append(x[p, d, t_id] * 1000000)
+
+        # 優先順位 2: Late-Early（おそはや）回避ペナルティ [重み: 1,000]
+        for d_idx in range(len(days) - 1):
+            d_curr = days[d_idx]
+            d_next = days[d_idx + 1]
+            for p in existing_members:
+                for t1_id, t1_info in tasks_master.items():
+                    if str(t1_info.get("EndType", "")).strip() == "Late":
+                        for t2_id, t2_info in tasks_master.items():
+                            if str(t2_info.get("StartType", "")).strip() == "Early":
+                                late_early = model.NewBoolVar(f"le_{p}_{d_curr}_{t1_id}_{t2_id}")
+                                model.AddBoolAnd(
+                                    [x[p, d_curr, t1_id], x[p, d_next, t2_id]]
+                                ).OnlyEnforceIf(late_early)
+                                model.AddBoolOr(
+                                    [x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]
+                                ).OnlyEnforceIf(late_early.Not())
+                                penalty_terms.append(late_early * 1000)
+
+        # 優先順位 3: 負荷平準化ペナルティ [重み: 1]
+        for p in existing_members:
+            p_load_list = []
+            for d in days:
+                for t in all_tasks:
+                    load_val = tasks_master[t].get("Load", 0)
+                    try:
+                        load_val = int(load_val)
+                    except ValueError:
+                        load_val = 0
+                    if load_val > 0:
+                        p_load_list.append(x[p, d, t] * load_val)
+            if p_load_list:
+                penalty_terms.append(sum(p_load_list))
+
+        if penalty_terms:
+            model.Minimize(sum(penalty_terms))
+
+        # ソルバーの実行
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 30.0
+        status = solver.Solve(model)
+
+        log(f"ソルバー実行ステータス: {solver.StatusName(status)}")
+
+        # 結果出力の構築
+        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+            result_rows = []
+
+            for d in days:
+                row = {"Date": d}
+                for p in existing_members:
+                    p_role = member_role.get(p, "MC")
+                    for t in all_tasks:
+                        if solver.Value(x[p, d, t]) == 1:
+                            disp_no = internal_to_disp.get(t, t)
+                            if p_role == "MC" and (t.startswith("M_") or t.startswith("C_")):
+                                suffix = "M" if t.startswith("M_") else "C"
+                                row[p] = f"{disp_no}{suffix}"
+                            else:
+                                row[p] = disp_no
+                            break
+                result_rows.append(row)
+
+            # 横書きフォーマットに再転置して出力
+            df_result_vert = pd.DataFrame(result_rows)
+            df_result_horiz = df_result_vert.set_index("Date").T.reset_index()
+            df_result_horiz.rename(columns={"index": header_col}, inplace=True)
+
+            # Name 列の復元
+            if has_name:
+                df_result_horiz.insert(
+                    1, "Name", df_result_horiz[header_col].map(member_names).fillna("")
+                )
+
+            # DayType 行の復元
+            day_type_output_row = {header_col: "DayType"}
+            if has_name:
+                day_type_output_row["Name"] = ""
+            for d in days:
+                day_type_output_row[d] = day_type_map.get(d, "")
+
+            df_dt_row = pd.DataFrame([day_type_output_row])
+            df_result_final = pd.concat([df_dt_row, df_result_horiz], ignore_index=True)
+
+            return df_result_final, True, "最適化成功", logs
+        else:
+            return df_initial_raw, False, "制約を満たす解が見つかりませんでした。", logs
 
     except Exception as e:
         err_msg = traceback.format_exc()
@@ -142,59 +370,56 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
         return df_initial_raw, False, str(e), logs
 
 
-# --- Streamlit メインUI ---
+# --- Main Streamlit UI ---
 def main():
-    st.title("勤務変更補助システム")
-    st.caption("自動シフトトレード・制約最適化ソルバー")
+    if check_password():
+        st.title("勤務変更補助システム")
+        st.caption("自動シフトトレード・制約最適化ソルバー (OR-Tools CP-SAT)")
 
-    st.subheader("1. データファイルのアップロード")
-    file_members = st.file_uploader(
-        "メンバーマスター (Member_Master.csv)", type=["csv"], key="u_members"
-    )
-    file_tasks = st.file_uploader(
-        "仕業マスター (Task_Master.csv)", type=["csv"], key="u_tasks"
-    )
-    file_initial = st.file_uploader(
-        "初期勤務表 (Initial_Schedule.csv)", type=["csv"], key="u_initial"
-    )
+        st.subheader("1. データファイルのアップロード")
+        file_members = st.file_uploader(
+            "メンバーマスター (Member_Master.csv)", type=["csv"], key="u_members"
+        )
+        file_tasks = st.file_uploader(
+            "仕業マスター (Task_Master.csv)", type=["csv"], key="u_tasks"
+        )
+        file_initial = st.file_uploader(
+            "初期勤務表 (Initial_Schedule.csv)", type=["csv"], key="u_initial"
+        )
 
-    st.subheader("2. 最適化計算の実行")
-    if st.button("シフト最適化の実行", key="btn_run"):
-        if file_members and file_tasks and file_initial:
-            with st.spinner("⏳ トレード最適化を実行中です..."):
-                try:
-                    df_m = safe_read_csv(file_members)
-                    df_t = safe_read_csv(file_tasks)
-                    df_i = safe_read_csv(file_initial)
+        st.subheader("2. 最適化計算の実行")
+        if st.button("シフト最適化の実行", key="btn_run"):
+            if file_members and file_tasks and file_initial:
+                with st.spinner("⏳ 制約条件および通勤コストの最適化を計算中..."):
+                    try:
+                        df_m = safe_read_csv(file_members)
+                        df_t = safe_read_csv(file_tasks)
+                        df_i = safe_read_csv(file_initial)
 
-                    result_df, success, msg, logs = run_optimization(
-                        df_m, df_t, df_i
-                    )
+                        result_df, success, msg, logs = run_optimization(df_m, df_t, df_i)
 
-                    if success:
-                        st.success("🎉 シフトのトレード調整・出力が完了しました！")
-                        csv_data = result_df.to_csv(index=False).encode("utf-8-sig")
-                        st.download_button(
-                            label="📥 調整済みシフト表 (Optimized_Schedule.csv) をダウンロード",
-                            data=csv_data,
-                            file_name="Optimized_Schedule.csv",
-                            mime="text/csv",
-                            key="btn_dl",
-                        )
-                    else:
-                        st.error(f"処理失敗: {msg}")
+                        if success:
+                            st.success("🎉 最適化計算が正常に完了しました！")
+                            csv_data = result_df.to_csv(index=False).encode("utf-8-sig")
+                            st.download_button(
+                                label="📥 調整済みシフト表 (Optimized_Schedule.csv) をダウンロード",
+                                data=csv_data,
+                                file_name="Optimized_Schedule.csv",
+                                mime="text/csv",
+                                key="btn_dl",
+                            )
+                        else:
+                            st.warning(f"⚠️ {msg}")
 
-                    with st.expander("🔍 詳細ログ・トレード履歴を表示"):
-                        st.text("\n".join(logs))
+                        with st.expander("🔍 ソルバーログ・詳細情報を表示"):
+                            st.text("\n".join(logs))
 
-                except Exception as e:
-                    st.error(f"処理中に予期せぬエラーが発生しました: {str(e)}")
-                    with st.expander("🚨 エラートレースバック"):
-                        st.code(traceback.format_exc())
-        else:
-            st.warning(
-                "⚠️ 3つのファイル（メンバーマスター・仕業マスター・初期勤務表）をすべて指定してください。"
-            )
+                    except Exception as e:
+                        st.error(f"処理中に予期せぬエラーが発生しました: {str(e)}")
+                        with st.expander("🚨 エラートレースバック"):
+                            st.code(traceback.format_exc())
+            else:
+                st.error("エラー: 3つのファイル（メンバーマスター・仕業マスター・初期勤務表）をすべて指定してください。")
 
 
 if __name__ == "__main__":
