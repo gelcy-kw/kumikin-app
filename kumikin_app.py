@@ -87,11 +87,16 @@ if check_password():
         tasks_master = df_tasks.set_index('TaskID').to_dict('index')
         all_tasks = list(tasks_master.keys())
 
-        # 表示用ID(101_W -> 101)から内部ID(101_W)へのマッピング
+        # 表示用ID(M_101_W -> 101)から内部ID(M_101_W)へのマッピング
         disp_to_internal = {}
         internal_to_disp = {}
         for t_id, t_info in tasks_master.items():
-            disp_no = t_id.split('_')[0] if '_' in t_id else t_id
+            # M_101_W や C_11_W から番号部分(101, 11)を安全に抽出
+            clean_id = t_id
+            if clean_id.startswith('M_') or clean_id.startswith('C_'):
+                clean_id = clean_id[2:]
+            disp_no = clean_id.split('_')[0] if '_' in clean_id else clean_id
+            
             d_type = str(t_info.get('DayType', 'All')).strip()
             disp_to_internal[(disp_no, d_type)] = t_id
             disp_to_internal[(disp_no, 'All')] = t_id
@@ -118,7 +123,6 @@ if check_password():
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
         # ハード制約1.5: 資格（Role）ミスマッチの禁止
-        # M(専任運転士)は C仕業禁止、C(専任車掌)は M仕業禁止、MC(兼任)は両方OK
         for p in existing_members:
             p_role = member_role.get(p, 'MC')
             for t_id, t_info in tasks_master.items():
@@ -151,7 +155,7 @@ if check_password():
                     if 'OFF' in all_tasks:
                         model.Add(x[p, d, 'OFF'] == 1)
 
-                # 2. 特殊仕業（A1~A7, J1~J6, R1~R6, S1~S3）のロック（DayType問わず固定）
+                # 2. 特殊仕業（A1~A7, J1~J6, R1~R6, S1~S3）のロック
                 elif raw_t in SPECIAL_DUTIES:
                     if internal_t in all_tasks:
                         model.Add(x[p, d, internal_t] == 1)
@@ -166,7 +170,7 @@ if check_password():
                 count = converted_day_tasks.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == count)
 
-        # ハード制約3: 連続ペアタスク制約（アプローチA：翌日のDayTypeに合わせて自動動的変換）
+        # ハード制約3: 連続ペアタスク制約
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -222,15 +226,24 @@ if check_password():
         solver.parameters.max_time_in_seconds = 30.0
         status = solver.Solve(model)
         
+        # 結果の出力処理（MC兼任者のみサフィックス M/C を付与）
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             result_rows = []
             
             for d in days:
                 row = {'Date': d}
                 for p in existing_members:
+                    p_role = member_role.get(p, 'MC')
                     for t in all_tasks:
                         if solver.Value(x[p, d, t]) == 1:
-                            row[p] = internal_to_disp.get(t, t)
+                            disp_no = internal_to_disp.get(t, t)
+                            
+                            # MC(兼任者)の場合、M_ / C_ 接頭辞に応じてサフィックス(M/C)を付与
+                            if p_role == 'MC' and (t.startswith('M_') or t.startswith('C_')):
+                                suffix = 'M' if t.startswith('M_') else 'C'
+                                row[p] = f"{disp_no}{suffix}"  # 例: 11M, 11C
+                            else:
+                                row[p] = disp_no  # 通常の人は番号のみ (例: 11)
                             break
                 result_rows.append(row)
             
