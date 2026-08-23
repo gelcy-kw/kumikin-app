@@ -48,8 +48,16 @@ if check_password():
             col_str = str(col).strip()
             day_type_map[col_str] = str(day_types_row[col].values[0]).strip()
 
-        # Member_Master のメンバーIDリスト
-        members = [str(m).strip() for m in df_members['MemberID'].tolist()]
+        # Member_Master の準備（MemberID, BaseArea, Role）
+        df_members['MemberID'] = df_members['MemberID'].astype(str).str.strip()
+        members = df_members['MemberID'].tolist()
+        member_home = df_members.set_index('MemberID')['BaseArea'].to_dict()
+        
+        # メンバーの職種(Role: M / C / MC)のマッピング（無ければ MC 扱い）
+        if 'Role' in df_members.columns:
+            member_role = df_members.set_index('MemberID')['Role'].astype(str).str.strip().to_dict()
+        else:
+            member_role = {m: 'MC' for m in members}
 
         # メンバーの行のみを安全に抽出（DayType行を除外）
         df_members_sched = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() != 'DayType'].copy()
@@ -77,7 +85,6 @@ if check_password():
         # タスクマスターの準備
         df_tasks['TaskID'] = df_tasks['TaskID'].astype(str).str.strip()
         tasks_master = df_tasks.set_index('TaskID').to_dict('index')
-        member_home = df_members.set_index(df_members['MemberID'].astype(str).str.strip())['BaseArea'].to_dict()
         all_tasks = list(tasks_master.keys())
 
         # 表示用ID(101_W -> 101)から内部ID(101_W)へのマッピング
@@ -109,7 +116,20 @@ if check_password():
         for p in existing_members:
             for d in days:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
-                
+
+        # ハード制約1.5: 資格（Role）ミスマッチの禁止
+        # M(専任運転士)は C仕業禁止、C(専任車掌)は M仕業禁止、MC(兼任)は両方OK
+        for p in existing_members:
+            p_role = member_role.get(p, 'MC')
+            for t_id, t_info in tasks_master.items():
+                t_role = str(t_info.get('Role', 'All')).strip()
+                if p_role == 'M' and t_role == 'C':
+                    for d in days:
+                        model.Add(x[p, d, t_id] == 0)
+                elif p_role == 'C' and t_role == 'M':
+                    for d in days:
+                        model.Add(x[p, d, t_id] == 0)
+
         # ハード制約2: 日別タスク割り当て数の維持 ＆ 特殊仕業・OFF・Fixed(固定日)のロック適用
         for d in days:
             d_type = day_type_map.get(d, 'Weekday')
@@ -150,15 +170,12 @@ if check_password():
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
-            next_d_type = day_type_map.get(d_next, 'Weekday') # 翌日の DayType
+            next_d_type = day_type_map.get(d_next, 'Weekday')
             
             for t_id, t_info in tasks_master.items():
                 pair_raw = str(t_info.get('PairTaskID', '')).strip()
                 if pair_raw and pair_raw != 'nan':
-                    # 枝番（_W, _H）が付いていてもいなくても表示用IDを取得
                     pair_disp = pair_raw.split('_')[0]
-                    
-                    # 翌日の DayType に合わせて適切な内部 TaskID を特定する
                     resolved_pair_id = disp_to_internal.get(
                         (pair_disp, next_d_type), 
                         disp_to_internal.get((pair_disp, 'All'), pair_raw)
@@ -166,7 +183,6 @@ if check_password():
                     
                     if resolved_pair_id in tasks_master:
                         for p in existing_members:
-                            # 本日 t_id をやるなら、翌日は自動解決された resolved_pair_id を割り当てる
                             model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
         # 目的関数（ペナルティ項の最小化）
