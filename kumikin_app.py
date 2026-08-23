@@ -48,16 +48,26 @@ if check_password():
             col_str = str(col).strip()
             day_type_map[col_str] = str(day_types_row[col].values[0]).strip()
 
-        # Member_Master の準備（MemberID, BaseArea, Role）
+        # Member_Master の準備（MemberID, Name, BaseArea, Role, Gender）
         df_members['MemberID'] = df_members['MemberID'].astype(str).str.strip()
         members = df_members['MemberID'].tolist()
         member_home = df_members.set_index('MemberID')['BaseArea'].to_dict()
         
-        # メンバーの職種(Role: M / C / MC)のマッピング（無ければ MC 扱い）
+        # Name 列のマッピング
+        has_name = 'Name' in df_members.columns
+        member_names = df_members.set_index('MemberID')['Name'].to_dict() if has_name else {}
+
+        # 職種(Role)のマッピング（無ければ MC 扱い）
         if 'Role' in df_members.columns:
             member_role = df_members.set_index('MemberID')['Role'].astype(str).str.strip().to_dict()
         else:
             member_role = {m: 'MC' for m in members}
+
+        # 性別(Gender)のマッピング（無ければ M 扱い）
+        if 'Gender' in df_members.columns:
+            member_gender = df_members.set_index('MemberID')['Gender'].astype(str).str.strip().to_dict()
+        else:
+            member_gender = {m: 'M' for m in members}
 
         # メンバーの行のみを安全に抽出（DayType行を除外）
         df_members_sched = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() != 'DayType'].copy()
@@ -91,7 +101,6 @@ if check_password():
         disp_to_internal = {}
         internal_to_disp = {}
         for t_id, t_info in tasks_master.items():
-            # M_101_W や C_11_W から番号部分(101, 11)を安全に抽出
             clean_id = t_id
             if clean_id.startswith('M_') or clean_id.startswith('C_'):
                 clean_id = clean_id[2:]
@@ -133,6 +142,16 @@ if check_password():
                 elif p_role == 'C' and t_role == 'M':
                     for d in days:
                         model.Add(x[p, d, t_id] == 0)
+
+        # ハード制約1.6: 女性用宿泊設備なし仕業の割り当て禁止 (FemaleAllowed == 'N')
+        for p in existing_members:
+            p_gender = member_gender.get(p, 'M')
+            if p_gender == 'F':  # 女性メンバーの場合
+                for t_id, t_info in tasks_master.items():
+                    female_ok = str(t_info.get('FemaleAllowed', 'Y')).strip().upper()
+                    if female_ok == 'N':
+                        for d in days:
+                            model.Add(x[p, d, t_id] == 0)
 
         # ハード制約2: 日別タスク割り当て数の維持 ＆ 特殊仕業・OFF・Fixed(固定日)のロック適用
         for d in days:
@@ -226,7 +245,7 @@ if check_password():
         solver.parameters.max_time_in_seconds = 30.0
         status = solver.Solve(model)
         
-        # 結果の出力処理（MC兼任者のみサフィックス M/C を付与）
+        # 結果の出力処理
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             result_rows = []
             
@@ -237,13 +256,11 @@ if check_password():
                     for t in all_tasks:
                         if solver.Value(x[p, d, t]) == 1:
                             disp_no = internal_to_disp.get(t, t)
-                            
-                            # MC(兼任者)の場合、M_ / C_ 接頭辞に応じてサフィックス(M/C)を付与
                             if p_role == 'MC' and (t.startswith('M_') or t.startswith('C_')):
                                 suffix = 'M' if t.startswith('M_') else 'C'
-                                row[p] = f"{disp_no}{suffix}"  # 例: 11M, 11C
+                                row[p] = f"{disp_no}{suffix}"
                             else:
-                                row[p] = disp_no  # 通常の人は番号のみ (例: 11)
+                                row[p] = disp_no
                             break
                 result_rows.append(row)
             
@@ -252,8 +269,14 @@ if check_password():
             df_result_horiz = df_result_vert.set_index('Date').T.reset_index()
             df_result_horiz.rename(columns={'index': header_col}, inplace=True)
             
+            # Name 列が存在する場合は復元挿入
+            if has_name:
+                df_result_horiz.insert(1, 'Name', df_result_horiz[header_col].map(member_names).fillna(''))
+
             # 先頭に DayType 行を復元
             day_type_output_row = {header_col: 'DayType'}
+            if has_name:
+                day_type_output_row['Name'] = ''
             for d in days:
                 day_type_output_row[d] = day_type_map.get(d, '')
             
