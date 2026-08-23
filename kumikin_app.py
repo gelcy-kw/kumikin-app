@@ -180,12 +180,17 @@ if check_password():
                 internal_t = disp_to_internal.get((raw_t, d_type), disp_to_internal.get((raw_t, 'All'), raw_t))
                 converted_day_tasks.append(internal_t)
                 
+                # 1. OFF のセルは絶対移動しないように固定（ロック）
                 if raw_t == 'OFF' or internal_t == 'OFF':
                     if 'OFF' in all_tasks:
                         model.Add(x[p, d, 'OFF'] == 1)
+
+                # 2. 特殊仕業のロック
                 elif raw_t in SPECIAL_DUTIES:
                     if internal_t in all_tasks:
                         model.Add(x[p, d, internal_t] == 1)
+
+                # 3. Fixed (トレード対象外の日) ロック
                 elif d_type == 'Fixed':
                     if internal_t in all_tasks:
                         model.Add(x[p, d, internal_t] == 1)
@@ -194,7 +199,10 @@ if check_password():
                 count = converted_day_tasks.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == count)
 
-        # ハード制約3: 連続ペアタスク制約
+        # 目的関数（ペナルティ項の最小化）
+        penalty_terms = []
+
+        # 💡【ソフト化】連続ペアタスク制約（ハード禁止ではなくペナルティへ変更）
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -211,20 +219,22 @@ if check_password():
                     
                     if resolved_pair_id in tasks_master:
                         for p in existing_members:
-                            model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
+                            # 今日t_idをやって、明日ペア仕業をやらない場合はペナルティ [重み: 10,000,000]
+                            pair_violated = model.NewBoolVar(f'pv_{p}_{d_curr}_{t_id}')
+                            model.Add(x[p, d_curr, t_id] == 1).OnlyEnforceIf(pair_violated.Not())
+                            model.Add(x[p, d_next, resolved_pair_id] == 0).OnlyEnforceIf(pair_violated.Not())
+                            # ペア未達成時の強力ペナルティ
+                            penalty_terms.append(pair_violated * 10000000)
 
-        # 目的関数（ペナルティ項の最小化）
-        penalty_terms = []
-        
-        # 優先順位 1: 拠点ミスマッチペナルティ
+        # 優先順位 1: 拠点ミスマッチペナルティ [重み: 1,000,000]
         for p in existing_members:
             home_st = member_home.get(p, '')
             for d in days:
                 for t_id, t_info in tasks_master.items():
-                    if str(t_info['TargetArea']).strip().upper() != str(home_st).strip().upper():
+                    if str(t_info.get('TargetArea', '')).strip().upper() != str(home_st).strip().upper():
                         penalty_terms.append(x[p, d, t_id] * 1000000)
 
-        # 優先順位 2: Late-Early 回避ペナルティ
+        # 優先順位 2: Late-Early 回避ペナルティ [重み: 1,000]
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -238,22 +248,21 @@ if check_password():
                                 model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
                                 penalty_terms.append(late_early * 1000)
 
-        # 優先順位 3: 負荷平準化ペナルティ
+        # 優先順位 3: 負荷平準化ペナルティ [重み: 1]
         for p in existing_members:
-            p_diff = sum(x[p, d, t] * int(tasks_master[t]['Load']) for d in days for t in all_tasks)
+            p_diff = sum(x[p, d, t] * int(tasks_master[t].get('Load', 0)) for d in days for t in all_tasks)
             penalty_terms.append(p_diff)
 
         model.Minimize(sum(penalty_terms))
         
-        # ⚡【修正ポイント】高速化・早期打切りパラメータ設定
+        # ソルバーの実行設定
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 60.0  # 60秒で打切り
-        solver.parameters.relative_gap_limit = 0.05   # 5%以内の良解が得られたら終了
-        solver.parameters.num_search_workers = 8     # 並列ワーカーの活用
+        solver.parameters.max_time_in_seconds = 60.0
+        solver.parameters.num_search_workers = 8
         
         status = solver.Solve(model)
         
-        # 実行可能解（FEASIBLE）または最適解（OPTIMAL）なら出力
+        # 結果の判定と出力
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             result_rows = []
             
@@ -290,12 +299,13 @@ if check_password():
             
             return df_result_final, True
         else:
+            st.error(f"ソルバーの実行ステータス: {solver.StatusName(status)} (解が見つかりません)")
             return df_initial_raw, False
 
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
         if file_members and file_tasks and file_initial:
-            with st.spinner("制約条件を計算中... (最大60秒)"):
+            with st.spinner("制約条件を計算中..."):
                 df_m = read_csv_safe(file_members)
                 df_t = read_csv_safe(file_tasks)
                 df_i = read_csv_safe(file_initial)
@@ -303,9 +313,9 @@ if check_password():
                 result_df, success = run_optimization(df_m, df_t, df_i)
                 
                 if success:
-                    st.success("シフトの最適化（実用解の作成）が完了しました！")
+                    st.success("シフトの最適化が完了しました！")
                 else:
-                    st.warning("条件が厳しすぎて解が見つかりませんでした。制約を見直してください。")
+                    st.warning("解が見つかりませんでした。データ設定を確認してください。")
                 
                 csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                 st.download_button(
