@@ -36,7 +36,7 @@ if check_password():
         header_col = df_initial_raw.columns[0]
         
         # DayType行の取得
-        day_types_row = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() == 'DayType']
+        day_types_row = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip().str.upper() == 'DAYTYPE']
         if day_types_row.empty:
             st.error("Initial_Schedule.csv に 'DayType' 行が見つかりません。")
             return df_initial_raw, False
@@ -51,26 +51,26 @@ if check_password():
         # Member_Master の準備（MemberID, Name, BaseArea, Role, Gender）
         df_members['MemberID'] = df_members['MemberID'].astype(str).str.strip()
         members = df_members['MemberID'].tolist()
-        member_home = df_members.set_index('MemberID')['BaseArea'].to_dict()
+        member_home = df_members.set_index('MemberID')['BaseArea'].astype(str).str.strip().to_dict()
         
         # Name 列のマッピング
         has_name = 'Name' in df_members.columns
         member_names = df_members.set_index('MemberID')['Name'].to_dict() if has_name else {}
 
-        # 職種(Role)のマッピング（無ければ MC 扱い）
+        # 職種(Role)のマッピング（小文字入力吸収のため .upper() 適用）
         if 'Role' in df_members.columns:
-            member_role = df_members.set_index('MemberID')['Role'].astype(str).str.strip().to_dict()
+            member_role = df_members.set_index('MemberID')['Role'].astype(str).str.strip().str.upper().to_dict()
         else:
             member_role = {m: 'MC' for m in members}
 
-        # 性別(Gender)のマッピング（無ければ M 扱い）
+        # 性別(Gender)のマッピング（小文字入力吸収のため .upper() 適用）
         if 'Gender' in df_members.columns:
-            member_gender = df_members.set_index('MemberID')['Gender'].astype(str).str.strip().to_dict()
+            member_gender = df_members.set_index('MemberID')['Gender'].astype(str).str.strip().str.upper().to_dict()
         else:
             member_gender = {m: 'M' for m in members}
 
         # メンバーの行のみを安全に抽出（DayType行を除外）
-        df_members_sched = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() != 'DayType'].copy()
+        df_members_sched = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip().str.upper() != 'DAYTYPE'].copy()
         df_members_sched[header_col] = df_members_sched[header_col].astype(str).str.strip()
 
         # 縦書き(行:日付, 列:人員)構造を作成
@@ -92,8 +92,8 @@ if check_password():
         model = cp_model.CpModel()
         days = dates
         
-        # タスクマスターの準備
-        df_tasks['TaskID'] = df_tasks['TaskID'].astype(str).str.strip()
+        # タスクマスターの準備（文字揃え・大文字化）
+        df_tasks['TaskID'] = df_tasks['TaskID'].astype(str).str.strip().str.upper()
         tasks_master = df_tasks.set_index('TaskID').to_dict('index')
         all_tasks = list(tasks_master.keys())
 
@@ -107,8 +107,8 @@ if check_password():
             disp_no = clean_id.split('_')[0] if '_' in clean_id else clean_id
             
             d_type = str(t_info.get('DayType', 'All')).strip()
-            disp_to_internal[(disp_no, d_type)] = t_id
-            disp_to_internal[(disp_no, 'All')] = t_id
+            disp_to_internal[(disp_no.upper(), d_type)] = t_id
+            disp_to_internal[(disp_no.upper(), 'All')] = t_id
             internal_to_disp[t_id] = disp_no
 
         # 特殊仕業（固定対象）のリスト定義
@@ -135,7 +135,7 @@ if check_password():
         for p in existing_members:
             p_role = member_role.get(p, 'MC')
             for t_id, t_info in tasks_master.items():
-                t_role = str(t_info.get('Role', 'All')).strip()
+                t_role = str(t_info.get('Role', 'All')).strip().upper()
                 if p_role == 'M' and t_role == 'C':
                     for d in days:
                         model.Add(x[p, d, t_id] == 0)
@@ -161,7 +161,7 @@ if check_password():
             converted_day_tasks = []
             for p in existing_members:
                 if not day_row.empty and p in day_row.columns:
-                    raw_t = str(day_row[p].values[0]).strip()
+                    raw_t = str(day_row[p].values[0]).strip().upper()  # 小文字入力を大文字に統一
                 else:
                     raw_t = 'OFF'
                 
@@ -196,8 +196,8 @@ if check_password():
             next_d_type = day_type_map.get(d_next, 'Weekday')
             
             for t_id, t_info in tasks_master.items():
-                pair_raw = str(t_info.get('PairTaskID', '')).strip()
-                if pair_raw and pair_raw != 'nan':
+                pair_raw = str(t_info.get('PairTaskID', '')).strip().upper()
+                if pair_raw and pair_raw != 'NAN':
                     pair_disp = pair_raw.split('_')[0]
                     resolved_pair_id = disp_to_internal.get(
                         (pair_disp, next_d_type), 
@@ -216,7 +216,7 @@ if check_password():
             home_st = member_home.get(p, '')
             for d in days:
                 for t_id, t_info in tasks_master.items():
-                    if str(t_info['TargetArea']).strip() != str(home_st).strip():
+                    if str(t_info['TargetArea']).strip().upper() != str(home_st).strip().upper():
                         penalty_terms.append(x[p, d, t_id] * 1000000)
 
         # 優先順位 2: Late-Early（おそはや）回避ペナルティ [重み: 1,000]
