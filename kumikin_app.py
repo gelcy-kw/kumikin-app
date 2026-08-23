@@ -5,37 +5,36 @@ from ortools.sat.python import cp_model
 # ページ基本設定
 st.set_page_config(page_title="勤務変更補助システム", layout="centered")
 
-def check_password():
-    """暗証番号によるアクセス制限"""
-    if "password_correct" not in st.session_state:
-        st.session_state["password_correct"] = False
+# --- パスワード認証 ---
+if "password_correct" not in st.session_state:
+    st.session_state["password_correct"] = False
 
-    if not st.session_state["password_correct"]:
-        st.title("🔒 アクセス制限")
-        pwd = st.text_input("パスコードを入力してください", type="password", key="pwd_input")
-        if st.button("ログイン", key="login_btn"):
-            if pwd == "1026":  # パスコード
-                st.session_state["password_correct"] = True
-                st.rerun()
-            else:
-                st.error("パスコードが正しくありません")
-        return False
-    return True
+if not st.session_state["password_correct"]:
+    st.title("🔒 アクセス制限")
+    pwd = st.text_input("パスコードを入力してください", type="password", key="pwd_input")
+    if st.button("ログイン", key="login_btn"):
+        if pwd == "1026":
+            st.session_state["password_correct"] = True
+            st.rerun()
+        else:
+            st.error("パスコードが正しくありません")
+    st.stop()
 
+# --- CSV読み込み関数 ---
 def read_csv_safe(file_or_path):
-    """Shift_JIS(CP932)やUTF-8などの文字コードの違いを自動判別して安全にCSVを読み込む"""
     encodings = ['utf-8-sig', 'utf-8', 'cp932', 'shift_jis']
     for enc in encodings:
         try:
             file_or_path.seek(0)
             return pd.read_csv(file_or_path, encoding=enc)
-        except (UnicodeDecodeError, Exception):
+        except Exception:
             continue
     file_or_path.seek(0)
     return pd.read_csv(file_or_path, encoding='cp932', encoding_errors='replace')
 
+# --- 最適化ロジック ---
 def run_optimization(df_members, df_tasks, df_initial_raw):
-    # 0. 空列・不要列の除去クリーニング
+    # 0. 空列・不要列の除去
     df_initial_raw = df_initial_raw.loc[:, ~df_initial_raw.columns.str.contains('^Unnamed')]
     df_initial_raw = df_initial_raw.loc[:, df_initial_raw.columns.notna() & (df_initial_raw.columns != '')]
 
@@ -46,14 +45,13 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
     if day_types_row.empty:
         return df_initial_raw, False, "Initial_Schedule.csv に 'DayType' 行が見つかりません。"
     
-    # 日付ごとの DayType マッピング
     dates = [str(c).strip() for c in df_initial_raw.columns[1:]]
     day_type_map = {}
     for col in df_initial_raw.columns[1:]:
         col_str = str(col).strip()
         day_type_map[col_str] = str(day_types_row[col].values[0]).strip()
 
-    # Member_Master の準備
+    # Member_Master 準備
     df_members['MemberID'] = df_members['MemberID'].astype(str).str.strip()
     members = df_members['MemberID'].tolist()
     member_home = df_members.set_index('MemberID')['BaseArea'].astype(str).str.strip().to_dict()
@@ -90,7 +88,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
     model = cp_model.CpModel()
     days = dates
     
-    # タスクマスターの準備
+    # Task_Master 準備
     df_tasks['TaskID'] = df_tasks['TaskID'].astype(str).str.strip().str.upper()
     tasks_master = df_tasks.set_index('TaskID').to_dict('index')
     all_tasks = list(tasks_master.keys())
@@ -122,14 +120,14 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
             for t in all_tasks:
                 x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
                 
-    # ハード制約1: 1人1日1タスク（絶対強制）
+    # ハード制約: 1人1日1タスク
     for p in existing_members:
         for d in days:
             model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
     penalty_terms = []
 
-    # 1. 資格（Role）ミスマッチのペナルティ
+    # 1. 資格ミスマッチペナルティ
     for p in existing_members:
         p_role = member_role.get(p, 'MC')
         for t_id, t_info in tasks_master.items():
@@ -138,7 +136,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                 for d in days:
                     penalty_terms.append(x[p, d, t_id] * 10000000)
 
-    # 2. 女性用宿泊設備なしのペナルティ
+    # 2. 女性専用設備ペナルティ
     for p in existing_members:
         p_gender = member_gender.get(p, 'M')
         if p_gender == 'F':
@@ -148,7 +146,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                     for d in days:
                         penalty_terms.append(x[p, d, t_id] * 10000000)
 
-    # 3. 日別タスク割り当て数の維持（人数不一致へのゆるいペナルティ）
+    # 3. タスク人数の維持（ゆるいペナルティ）
     for d in days:
         d_type = day_type_map.get(d, 'Weekday')
         day_row = df_initial_shift[df_initial_shift['Date'] == d]
@@ -202,7 +200,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                         model.Add(x[p, d_next, resolved_pair_id] == 0).OnlyEnforceIf(pair_violated.Not())
                         penalty_terms.append(pair_violated * 1000000)
 
-    # 5. 拠点ミスマッチペナルティ
+    # 5. 拠点ペナルティ
     for p in existing_members:
         home_st = member_home.get(p, '')
         for d in days:
@@ -224,7 +222,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                             model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
                             penalty_terms.append(late_early * 1000)
 
-    # 7. 負荷平準化ペナルティ
+    # 7. 負荷平準化
     for p in existing_members:
         p_diff = sum(x[p, d, t] * int(tasks_master[t].get('Load', 0)) for d in days for t in all_tasks)
         penalty_terms.append(p_diff)
@@ -271,29 +269,25 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
     else:
         return df_initial_raw, False, "解が見つかりませんでした。"
 
-# アプリメイン画面
-if check_password():
-    st.title("勤務変更補助システム")
-    st.caption("自動シフトトレード・制約最適化ソルバー")
+# --- メイン画面 ---
+st.title("勤務変更補助システム")
+st.caption("自動シフトトレード・制約最適化ソルバー")
 
-    st.subheader("1. データファイルのアップロード")
-    file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"], key="u_members")
-    file_tasks = st.file_uploader("仕業マスター (Task_Master.csv)", type=["csv"], key="u_tasks")
-    file_initial = st.file_uploader("初期勤務表 (Initial_Schedule.csv)", type=["csv"], key="u_initial")
+st.subheader("1. データファイルのアップロード")
+file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"], key="u_members")
+file_tasks = st.file_uploader("仕業マスター (Task_Master.csv)", type=["csv"], key="u_tasks")
+file_initial = st.file_uploader("初期勤務表 (Initial_Schedule.csv)", type=["csv"], key="u_initial")
 
-    st.subheader("2. 最適化計算の実行")
-    if st.button("シフト最適化の実行", key="btn_run"):
-        if file_members and file_tasks and file_initial:
-            progress_msg = st.empty()
-            progress_msg.info("⏳ 最適化計算を実行中です...（最大60秒お待ちください）")
-            
+st.subheader("2. 最適化計算の実行")
+if st.button("シフト最適化の実行", key="btn_run"):
+    if file_members and file_tasks and file_initial:
+        with st.spinner("⏳ 最適化計算を実行中です...（最大60秒お待ちください）"):
             try:
                 df_m = read_csv_safe(file_members)
                 df_t = read_csv_safe(file_tasks)
                 df_i = read_csv_safe(file_initial)
                 
                 result_df, success, msg = run_optimization(df_m, df_t, df_i)
-                progress_msg.empty() # メッセージを消去
                 
                 if success:
                     st.success("🎉 シフトの調整・最適化が正常に完了しました！")
@@ -308,7 +302,6 @@ if check_password():
                 else:
                     st.error(f"最適化失敗: {msg}")
             except Exception as e:
-                progress_msg.empty()
                 st.error(f"処理中にエラーが発生しました: {str(e)}")
-        else:
-            st.warning("⚠️ 3つのファイル（メンバーマスター・仕業マスター・初期勤務表）をすべて指定してください。")
+    else:
+        st.warning("⚠️ 3つのファイル（メンバーマスター・仕業マスター・初期勤務表）をすべて指定してください。")
