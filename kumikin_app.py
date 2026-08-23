@@ -22,6 +22,18 @@ def check_password():
         return False
     return True
 
+def read_csv_safe(file_or_path):
+    """Shift_JIS(CP932)やUTF-8などの文字コードの違いを自動判別して安全にCSVを読み込む"""
+    encodings = ['utf-8-sig', 'utf-8', 'cp932', 'shift_jis']
+    for enc in encodings:
+        try:
+            file_or_path.seek(0)
+            return pd.read_csv(file_or_path, encoding=enc)
+        except (UnicodeDecodeError, Exception):
+            continue
+    file_or_path.seek(0)
+    return pd.read_csv(file_or_path, encoding='cp932', encoding_errors='replace')
+
 if check_password():
     # --- メイン画面UI ---
     st.title("勤務変更補助システム")
@@ -291,9 +303,9 @@ if check_password():
     if st.button("シフト最適化の実行"):
         if file_members and file_tasks and file_initial:
             with st.spinner("制約条件を計算中..."):
-                df_m = pd.read_csv(file_members)
-                df_t = pd.read_csv(file_tasks)
-                df_i = pd.read_csv(file_initial)
+                df_m = read_csv_safe(file_members)
+                df_t = read_csv_safe(file_tasks)
+                df_i = read_csv_safe(file_initial)
                 
                 result_df, success = run_optimization(df_m, df_t, df_i)
                 
