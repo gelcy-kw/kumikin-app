@@ -65,7 +65,7 @@ if check_password():
         members = df_members['MemberID'].tolist()
         member_home = df_members.set_index('MemberID')['BaseArea'].astype(str).str.strip().to_dict()
         
-        # Name 列のマッピング（Member_Masterから取得）
+        # Name 列のマッピング
         has_name_in_master = 'Name' in df_members.columns
         member_names = df_members.set_index('MemberID')['Name'].astype(str).str.strip().to_dict() if has_name_in_master else {}
 
@@ -245,12 +245,15 @@ if check_password():
 
         model.Minimize(sum(penalty_terms))
         
-        # ソルバーの実行
+        # ⚡【修正ポイント】高速化・早期打切りパラメータ設定
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 30.0
+        solver.parameters.max_time_in_seconds = 60.0  # 60秒で打切り
+        solver.parameters.relative_gap_limit = 0.05   # 5%以内の良解が得られたら終了
+        solver.parameters.num_search_workers = 8     # 並列ワーカーの活用
+        
         status = solver.Solve(model)
         
-        # 結果の出力処理
+        # 実行可能解（FEASIBLE）または最適解（OPTIMAL）なら出力
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             result_rows = []
             
@@ -274,10 +277,10 @@ if check_password():
             df_result_horiz = df_result_vert.set_index('Date').T.reset_index()
             df_result_horiz.rename(columns={'index': header_col}, inplace=True)
             
-            # 💡【修正ポイント】MemberID(先頭列)の隣に Name 列を必ず挿入
+            # MemberID(先頭列)の隣に Name 列を挿入
             df_result_horiz.insert(1, 'Name', df_result_horiz[header_col].map(member_names).fillna(''))
 
-            # 先頭に DayType 行を復元（Name列の箇所は空欄にする）
+            # 先頭に DayType 行を復元
             day_type_output_row = {header_col: 'DayType', 'Name': ''}
             for d in days:
                 day_type_output_row[d] = day_type_map.get(d, '')
@@ -292,7 +295,7 @@ if check_password():
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
         if file_members and file_tasks and file_initial:
-            with st.spinner("制約条件を計算中..."):
+            with st.spinner("制約条件を計算中... (最大60秒)"):
                 df_m = read_csv_safe(file_members)
                 df_t = read_csv_safe(file_tasks)
                 df_i = read_csv_safe(file_initial)
@@ -300,9 +303,9 @@ if check_password():
                 result_df, success = run_optimization(df_m, df_t, df_i)
                 
                 if success:
-                    st.success("最適化計算が正常に完了しました。")
+                    st.success("シフトの最適化（実用解の作成）が完了しました！")
                 else:
-                    st.warning("最適な解が見つかりませんでした。初期シフトを維持します。")
+                    st.warning("条件が厳しすぎて解が見つかりませんでした。制約を見直してください。")
                 
                 csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                 st.download_button(
