@@ -99,8 +99,10 @@ if check_password():
                     if str(t1_info.get('EndType')) == 'Late':
                         for t2_id, t2_info in tasks_master.items():
                             if str(t2_info.get('StartType')) == 'Early':
-                                late_early = model.NewBoolVar(f'le_{p}_{d_curr}')
-                                model.AddBoolAnd([x[p, d_curr, t1_id], x[p, d_next, t2_id]]).Eavesdrop(late_early)
+                                late_early = model.NewBoolVar(f'le_{p}_{d_curr}_{t1_id}_{t2_id}')
+                                # 正しい論理積（AND条件）の書き方に修正
+                                model.AddBoolAnd([x[p, d_curr, t1_id], x[p, d_next, t2_id]]).OnlyEnforceIf(late_early)
+                                model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
                                 penalty_terms.append(late_early * 1000)
 
         # 優先順位 3: 負荷平準化ペナルティ [重み: 1]
