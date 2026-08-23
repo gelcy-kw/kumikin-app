@@ -18,17 +18,13 @@ def safe_read_csv(file):
             if hasattr(file, "seek"):
                 file.seek(0)
             df = pd.read_csv(file, encoding=enc)
-            st.write(f"ℹ️ [LOG] CSVを '{enc}' エンコーディングで読み込みました。")
             return df
-        except (UnicodeDecodeError, Exception):
+        except Exception:
             continue
 
     # 最終フォールバック
     if hasattr(file, "seek"):
         file.seek(0)
-    st.write(
-        "⚠️ [LOG] 対応する文字コードで正常にロードできなかったため、cp932 (置換モード) で強制ロードします。"
-    )
     return pd.read_csv(file, encoding="cp932", encoding_errors="replace")
 
 
@@ -37,7 +33,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
     logs = []
 
     def log(msg):
-        logs.append(msg)
+        logs.append(str(msg))
         print(f"[OPT_LOG] {msg}")
 
     try:
@@ -410,57 +406,61 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
 
 
 # --- Streamlit メインUI ---
-st.title("勤務変更補助システム")
-st.caption("自動シフトトレード・制約最適化ソルバー")
+def main():
+    st.title("勤務変更補助システム")
+    st.caption("自動シフトトレード・制約最適化ソルバー")
 
-st.subheader("1. データファイルのアップロード")
-file_members = st.file_uploader(
-    "メンバーマスター (Member_Master.csv)", type=["csv"], key="u_members"
-)
-file_tasks = st.file_uploader(
-    "仕業マスター (Task_Master.csv)", type=["csv"], key="u_tasks"
-)
-file_initial = st.file_uploader(
-    "初期勤務表 (Initial_Schedule.csv)", type=["csv"], key="u_initial"
-)
+    st.subheader("1. データファイルのアップロード")
+    file_members = st.file_uploader(
+        "メンバーマスター (Member_Master.csv)", type=["csv"], key="u_members"
+    )
+    file_tasks = st.file_uploader(
+        "仕業マスター (Task_Master.csv)", type=["csv"], key="u_tasks"
+    )
+    file_initial = st.file_uploader(
+        "初期勤務表 (Initial_Schedule.csv)", type=["csv"], key="u_initial"
+    )
 
-st.subheader("2. 最適化計算の実行")
-if st.button("シフト最適化の実行", key="btn_run"):
-    if file_members and file_tasks and file_initial:
-        with st.spinner("⏳ 最適化計算を実行中です..."):
-            try:
-                st.info("📂 CSVファイルの読み込みを開始します...")
-                df_m = safe_read_csv(file_members)
-                df_t = safe_read_csv(file_tasks)
-                df_i = safe_read_csv(file_initial)
+    st.subheader("2. 最適化計算の実行")
+    if st.button("シフト最適化の実行", key="btn_run"):
+        if file_members and file_tasks and file_initial:
+            with st.spinner("⏳ 最適化計算を実行中です..."):
+                try:
+                    df_m = safe_read_csv(file_members)
+                    df_t = safe_read_csv(file_tasks)
+                    df_i = safe_read_csv(file_initial)
 
-                st.info("🧠 最適化ソルバーを呼び出しています...")
-                result_df, success, msg, logs = run_optimization(
-                    df_m, df_t, df_i
-                )
-
-                if success:
-                    st.success("🎉 シフトの調整・最適化が正常に完了しました！")
-                    csv_data = result_df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        label="📥 調整済みシフト表 (Optimized_Schedule.csv) をダウンロード",
-                        data=csv_data,
-                        file_name="Optimized_Schedule.csv",
-                        mime="text/csv",
-                        key="btn_dl",
+                    result_df, success, msg, logs = run_optimization(
+                        df_m, df_t, df_i
                     )
-                else:
-                    st.error(f"最適化失敗: {msg}")
 
-                # 実行ログの表示領域
-                with st.expander("🔍 詳細ログを表示"):
-                    st.text("\n".join(logs))
+                    if success:
+                        st.success("🎉 シフトの調整・最適化が正常に完了しました！")
+                        csv_data = result_df.to_csv(index=False).encode(
+                            "utf-8-sig"
+                        )
+                        st.download_button(
+                            label="📥 調整済みシフト表 (Optimized_Schedule.csv) をダウンロード",
+                            data=csv_data,
+                            file_name="Optimized_Schedule.csv",
+                            mime="text/csv",
+                            key="btn_dl",
+                        )
+                    else:
+                        st.error(f"最適化失敗: {msg}")
 
-            except Exception as e:
-                st.error(f"処理中に予期せぬエラーが発生しました: {str(e)}")
-                with st.expander("🚨 エラートレースバック"):
-                    st.code(traceback.format_exc())
-    else:
-        st.warning(
-            "⚠️ 3つのファイル（メンバーマスター・仕業マスター・初期勤務表）をすべて指定してください。"
-        )
+                    with st.expander("🔍 詳細ログを表示"):
+                        st.text("\n".join(logs))
+
+                except Exception as e:
+                    st.error(f"処理中に予期せぬエラーが発生しました: {str(e)}")
+                    with st.expander("🚨 エラートレースバック"):
+                        st.code(traceback.format_exc())
+        else:
+            st.warning(
+                "⚠️ 3つのファイル（メンバーマスター・仕業マスター・初期勤務表）をすべて指定してください。"
+            )
+
+
+if __name__ == "__main__":
+    main()
