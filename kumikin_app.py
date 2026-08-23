@@ -46,7 +46,7 @@ def safe_read_csv(file):
     return pd.read_csv(file, encoding="cp932", encoding_errors="replace")
 
 
-# --- メインロジック (CpModel最適化ソルバー - 条件緩和版) ---
+# --- メインロジック (CpModel最適化ソルバー - OFF完全固定版) ---
 def run_optimization(df_members, df_tasks, df_initial_raw):
     logs = []
 
@@ -55,7 +55,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
         print(f"[OPT_LOG] {msg}")
 
     try:
-        log("ORTools CP-SAT ソルバーによる最適化計算（緩和モード）を開始します...")
+        log("ORTools CP-SAT ソルバーによる最適化計算を開始します (OFF絶対固定モード)...")
 
         # 1. 不要な Unnamed 列や空列の除外
         df_initial_raw = df_initial_raw.loc[
@@ -149,11 +149,18 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
         df_tasks["TaskID"] = df_tasks["TaskID"].astype(str).str.strip().str.upper()
         tasks_master = df_tasks.set_index("TaskID").to_dict("index")
         all_tasks = list(tasks_master.keys())
+        if "OFF" not in all_tasks:
+            all_tasks.append("OFF")
 
         # IDマッピングの構築
         disp_to_internal = {}
         internal_to_disp = {}
-        for t_id, t_info in tasks_master.items():
+        for t_id in all_tasks:
+            if t_id == "OFF":
+                disp_to_internal[("OFF", "All")] = "OFF"
+                internal_to_disp["OFF"] = "OFF"
+                continue
+            t_info = tasks_master.get(t_id, {})
             clean_id = t_id
             if clean_id.startswith("M_") or clean_id.startswith("C_"):
                 clean_id = clean_id[2:]
@@ -164,7 +171,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
             disp_to_internal[(disp_no.upper(), "All")] = t_id
             internal_to_disp[t_id] = disp_no
 
-        # 特殊仕業（絶対固定対象）の定義
+        # 特殊仕業の定義
         SPECIAL_DUTIES = (
             [f"A{i}" for i in range(1, 8)]
             + [f"J{i}" for i in range(1, 7)]
@@ -184,7 +191,9 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
             for d in days:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 【絶対制約 2】日別タスク割り当て数の維持 ＆ 特殊仕業・OFF・Fixed(固定日)のロック
+        penalty_terms = []
+
+        # 初期スケジュールの判定・固定ルールの適用
         for d in days:
             d_type = day_type_map.get(d, "Weekday")
             day_row = df_initial_shift[df_initial_shift["Date"] == d]
@@ -201,27 +210,28 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                 )
                 converted_day_tasks.append(internal_t)
 
-                # 1. OFF のセルは絶対移動しないように固定
+                # 🛑 【絶対禁止】OFFの日を動かすことは絶対不可
                 if raw_t == "OFF" or internal_t == "OFF":
-                    if "OFF" in all_tasks:
-                        model.Add(x[p, d, "OFF"] == 1)
+                    model.Add(x[p, d, "OFF"] == 1)
 
-                # 2. 特殊仕業の固定
-                elif raw_t in SPECIAL_DUTIES:
+                # 特殊仕業・Fixed日の厳密固定
+                elif raw_t in SPECIAL_DUTIES or d_type == "Fixed":
                     if internal_t in all_tasks:
                         model.Add(x[p, d, internal_t] == 1)
 
-                # 3. Fixed (トレード対象外の日) の固定
-                elif d_type == "Fixed":
-                    if internal_t in all_tasks:
-                        model.Add(x[p, d, internal_t] == 1)
-
-            # タスク総数の維持
+            # タスク必要数の保持（目標・ペナルティ制: 誤差が発生した場合は調整）
             for t in all_tasks:
-                count = converted_day_tasks.count(t)
-                model.Add(sum(x[p, d, t] for p in existing_members) == count)
+                if t == "OFF":
+                    continue
+                target_count = converted_day_tasks.count(t)
+                actual_count = sum(x[p, d, t] for p in existing_members)
+                diff = model.NewIntVar(-len(existing_members), len(existing_members), f"diff_{d}_{t}")
+                model.Add(diff == actual_count - target_count)
+                abs_diff = model.NewIntVar(0, len(existing_members), f"abs_diff_{d}_{t}")
+                model.AddAbsEquality(abs_diff, diff)
+                penalty_terms.append(abs_diff * 1000000)
 
-        # 【絶対制約 3】連続ペアタスク制約 (泊まり仕業を分離させない)
+        # 【連続ペアタスク制約】(泊まり仕業のペア維持 - 緩和ペナルティ)
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -236,67 +246,51 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                         disp_to_internal.get((pair_disp, "All"), pair_raw),
                     )
 
-                    if resolved_pair_id in tasks_master:
+                    if resolved_pair_id in all_tasks:
                         for p in existing_members:
-                            model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
+                            pair_mismatch = model.NewBoolVar(f"pm_{p}_{d_curr}_{t_id}")
+                            model.Add(x[p, d_curr, t_id] != x[p, d_next, resolved_pair_id]).OnlyEnforceIf(pair_mismatch)
+                            model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id]).OnlyEnforceIf(pair_mismatch.Not())
+                            penalty_terms.append(pair_mismatch * 5000000)
 
-        # 【目的関数】ペナルティ項の設計（緩和版）
-        penalty_terms = []
-
-        # 1. 資格 (Role) ミスマッチ [ソフト化ペナルティ: 10,000,000]
+        # ソフトペナルティ項 (資格・属性トレード最適化)
         for p in existing_members:
             p_role = member_role.get(p, "MC")
-            for t_id, t_info in tasks_master.items():
+            p_gender = member_gender.get(p, "M")
+            home_st = member_home.get(p, "")
+
+            for t_id in all_tasks:
+                if t_id == "OFF":
+                    continue
+                t_info = tasks_master.get(t_id, {})
+                
+                # 資格 (Role) ミスマッチ
                 t_role = str(t_info.get("Role", "All")).strip().upper()
                 if (p_role == "M" and t_role == "C") or (p_role == "C" and t_role == "M"):
                     for d in days:
                         penalty_terms.append(x[p, d, t_id] * 10000000)
 
-        # 2. 女性用設備なし仕業の割り当て [ソフト化ペナルティ: 10,000,000]
-        for p in existing_members:
-            p_gender = member_gender.get(p, "M")
-            if p_gender == "F":
-                for t_id, t_info in tasks_master.items():
+                # 女性設備ミスマッチ
+                if p_gender == "F":
                     female_ok = str(t_info.get("FemaleAllowed", "Y")).strip().upper()
                     if female_ok == "N":
                         for d in days:
                             penalty_terms.append(x[p, d, t_id] * 10000000)
 
-        # 3. 拠点ミスマッチペナルティ（通勤コスト最適化） [ペナルティ: 1,000,000]
-        for p in existing_members:
-            home_st = member_home.get(p, "")
-            for d in days:
-                for t_id, t_info in tasks_master.items():
-                    target_area = str(t_info.get("TargetArea", "")).strip().upper()
-                    if target_area and target_area != "NAN":
-                        if target_area != str(home_st).strip().upper():
-                            penalty_terms.append(x[p, d, t_id] * 1000000)
-
-        # 4. Late-Early 回避ペナルティ [ペナルティ: 1,000]
-        for d_idx in range(len(days) - 1):
-            d_curr = days[d_idx]
-            d_next = days[d_idx + 1]
-            for p in existing_members:
-                for t1_id, t1_info in tasks_master.items():
-                    if str(t1_info.get("EndType", "")).strip() == "Late":
-                        for t2_id, t2_info in tasks_master.items():
-                            if str(t2_info.get("StartType", "")).strip() == "Early":
-                                late_early = model.NewBoolVar(f"le_{p}_{d_curr}_{t1_id}_{t2_id}")
-                                model.AddBoolAnd(
-                                    [x[p, d_curr, t1_id], x[p, d_next, t2_id]]
-                                ).OnlyEnforceIf(late_early)
-                                model.AddBoolOr(
-                                    [x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]
-                                ).OnlyEnforceIf(late_early.Not())
-                                penalty_terms.append(late_early * 1000)
+                # 拠点ミスマッチ
+                target_area = str(t_info.get("TargetArea", "")).strip().upper()
+                if target_area and target_area != "NAN":
+                    if target_area != str(home_st).strip().upper():
+                        for d in days:
+                            penalty_terms.append(x[p, d, t_id] * 100000)
 
         if penalty_terms:
             model.Minimize(sum(penalty_terms))
 
         # ソルバーの実行パラメータ設定
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 60.0  # 探索時間を60秒に拡大
-        solver.parameters.num_search_workers = 4     # マルチスレッド探索
+        solver.parameters.max_time_in_seconds = 60.0
+        solver.parameters.num_search_workers = 4
         status = solver.Solve(model)
 
         log(f"ソルバー実行ステータス: {solver.StatusName(status)}")
@@ -338,9 +332,9 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
             df_dt_row = pd.DataFrame([day_type_output_row])
             df_result_final = pd.concat([df_dt_row, df_result_horiz], ignore_index=True)
 
-            return df_result_final, True, "最適化成功（実行可能解）", logs
+            return df_result_final, True, "最適化成功（OFFの日時は一切変更せずに解を出力しました）", logs
         else:
-            return df_initial_raw, False, "制約条件を緩めても解が見つかりませんでした。入力データをご確認ください。", logs
+            return df_initial_raw, False, "OFFを固定した状態では解が見つかりませんでした。データ間の整合性（日ごとの出勤人数とタスク数の不一致など）をご確認ください。", logs
 
     except Exception as e:
         err_msg = traceback.format_exc()
@@ -352,7 +346,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
 def main():
     if check_password():
         st.title("勤務変更補助システム")
-        st.caption("自動シフトトレード・制約最適化ソルバー (OR-Tools CP-SAT 緩和モード)")
+        st.caption("自動シフトトレード・制約最適化ソルバー (OFF絶対固定モード)")
 
         st.subheader("1. データファイルのアップロード")
         file_members = st.file_uploader(
@@ -368,7 +362,7 @@ def main():
         st.subheader("2. 最適化計算の実行")
         if st.button("シフト最適化の実行", key="btn_run"):
             if file_members and file_tasks and file_initial:
-                with st.spinner("⏳ 制約条件を調整して最適な組み合わせを計算中...（最大60秒）"):
+                with st.spinner("⏳ OFFを完全固定した上で出勤日のトレード最適化を計算中...（最大60秒）"):
                     try:
                         df_m = safe_read_csv(file_members)
                         df_t = safe_read_csv(file_tasks)
@@ -377,7 +371,7 @@ def main():
                         result_df, success, msg, logs = run_optimization(df_m, df_t, df_i)
 
                         if success:
-                            st.success("🎉 シフトの最適化トレードが完了しました！")
+                            st.success(f"🎉 {msg}")
                             csv_data = result_df.to_csv(index=False).encode("utf-8-sig")
                             st.download_button(
                                 label="📥 調整済みシフト表 (Optimized_Schedule.csv) をダウンロード",
@@ -387,9 +381,9 @@ def main():
                                 key="btn_dl",
                             )
                         else:
-                            st.warning(f"⚠️ {msg}")
+                            st.error(f"❌ {msg}")
 
-                        with st.expander("🔍 ソルバーログ・詳細情報を表示"):
+                        with st.expander("🔍 ソルバー実行ログを確認"):
                             st.text("\n".join(logs))
 
                     except Exception as e:
