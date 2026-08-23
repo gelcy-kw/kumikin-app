@@ -1,0 +1,7 @@
+TaskID,TargetArea,Load,StartType,EndType,PairTaskID
+101,A,1,Normal,Normal,
+102,A,2,Normal,Late,103
+103,A,2,Early,Normal,
+201,B,1,Normal,Normal,
+202,B,3,Normal,Late,203
+203,B,3,Early,Normal,
