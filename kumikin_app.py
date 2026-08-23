@@ -2,32 +2,35 @@ import streamlit as st
 import pandas as pd
 from ortools.sat.python import cp_model
 
-st.set_page_config(page_title="Task Schedule Optimizer", layout="centered")
+# ページ基本設定
+st.set_page_config(page_title="勤務変更補助システム", layout="centered")
 
 def check_password():
+    """暗証番号によるアクセス制限"""
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
 
     if not st.session_state["password_correct"]:
-        st.title("🔒 Restricted Access")
-        pwd = st.text_input("Passcode", type="password")
-        if st.button("Login"):
-            if pwd == "1026":
+        st.title("🔒 アクセス制限")
+        pwd = st.text_input("パスコードを入力してください", type="password")
+        if st.button("ログイン"):
+            if pwd == "1026":  # パスコード
                 st.session_state["password_correct"] = True
                 st.rerun()
             else:
-                st.error("Invalid Passcode")
+                st.error("パスコードが正しくありません")
         return False
     return True
 
 if check_password():
-    st.title("Task Schedule Optimizer")
-    st.caption("Resource Allocation & Constraint Solver (OFF Lock Supported)")
+    # --- メイン画面UI ---
+    st.title("勤務変更補助システム")
+    st.caption("自動シフトトレード・制約最適化ソルバー")
 
-    st.subheader("1. Load Data Files")
-    file_members = st.file_uploader("Member_Master.csv", type=["csv"])
-    file_tasks = st.file_uploader("Task_Master.csv", type=["csv"])
-    file_initial = st.file_uploader("Initial_Schedule.csv", type=["csv"])
+    st.subheader("1. データファイルのアップロード")
+    file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"])
+    file_tasks = st.file_uploader("仕業マスター (Task_Master.csv)", type=["csv"])
+    file_initial = st.file_uploader("初期勤務表 (Initial_Schedule.csv)", type=["csv"])
 
     def run_optimization(df_members, df_tasks, df_initial_raw):
         header_col = df_initial_raw.columns[0]
@@ -115,7 +118,7 @@ if check_password():
                 internal_t = disp_to_internal.get((raw_t, d_type), disp_to_internal.get((raw_t, 'All'), raw_t))
                 converted_day_tasks.append(internal_t)
                 
-                # 【新規改修】OFF のセルは絶対に移動しないように固定（ロック）！
+                # OFF のセルは絶対に移動しないように固定（ロック）！
                 if raw_t == 'OFF' or internal_t == 'OFF':
                     if 'OFF' in all_tasks:
                         model.Add(x[p, d, 'OFF'] == 1)
@@ -206,10 +209,10 @@ if check_password():
         else:
             return df_initial_raw, False
 
-    st.subheader("2. Run Solver")
-    if st.button("Process Optimization"):
+    st.subheader("2. 最適化計算の実行")
+    if st.button("シフト最適化の実行"):
         if file_members and file_tasks and file_initial:
-            with st.spinner("Solving constraint logic..."):
+            with st.spinner("制約条件を計算中..."):
                 df_m = pd.read_csv(file_members)
                 df_t = pd.read_csv(file_tasks)
                 df_i = pd.read_csv(file_initial)
@@ -217,16 +220,16 @@ if check_password():
                 result_df, success = run_optimization(df_m, df_t, df_i)
                 
                 if success:
-                    st.success("Optimization Completed.")
+                    st.success("最適化計算が正常に完了しました。")
                 else:
-                    st.warning("No optimal solution found. Original schedule retained.")
+                    st.warning("最適な解が見つかりませんでした。初期シフトを維持します。")
                 
                 csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                 st.download_button(
-                    label="Download Optimized_Schedule.csv",
+                    label="調整済みシフト表(Optimized_Schedule.csv)をダウンロード",
                     data=csv_data,
                     file_name="Optimized_Schedule.csv",
                     mime="text/csv"
                 )
         else:
-            st.error("Error: Please upload all 3 CSV files.")
+            st.error("エラー: 3つのファイル（メンバーマスター・仕業マスター・初期勤務表）をすべて指定してください。")
