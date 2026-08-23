@@ -90,6 +90,14 @@ if check_password():
             disp_to_internal[(disp_no, 'All')] = t_id
             internal_to_disp[t_id] = disp_no
 
+        # 特殊仕業（固定対象）のリスト定義
+        SPECIAL_DUTIES = (
+            [f"A{i}" for i in range(1, 8)] +
+            [f"J{i}" for i in range(1, 7)] +
+            [f"R{i}" for i in range(1, 7)] +
+            [f"S{i}" for i in range(1, 4)]
+        )
+
         # 決定変数: x[p, d, t]
         x = {}
         for p in existing_members:
@@ -102,7 +110,7 @@ if check_password():
             for d in days:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
                 
-        # ハード制約2: 日別タスク割り当て数の維持 ＆ OFFおよびFixed(固定日)のロック適用
+        # ハード制約2: 日別タスク割り当て数の維持 ＆ 特殊仕業・OFF・Fixed(固定日)のロック適用
         for d in days:
             d_type = day_type_map.get(d, 'Weekday')
             day_row = df_initial_shift[df_initial_shift['Date'] == d]
@@ -118,13 +126,18 @@ if check_password():
                 internal_t = disp_to_internal.get((raw_t, d_type), disp_to_internal.get((raw_t, 'All'), raw_t))
                 converted_day_tasks.append(internal_t)
                 
-                # OFF のセルは絶対に移動しないように固定（ロック）！
+                # 1. OFF のセルは絶対移動しないように固定（ロック）
                 if raw_t == 'OFF' or internal_t == 'OFF':
                     if 'OFF' in all_tasks:
                         model.Add(x[p, d, 'OFF'] == 1)
 
-                # Fixed (トレード対象外の日) なら初期配置のまま固定
-                if d_type == 'Fixed':
+                # 2. 特殊仕業（A1~A7, J1~J6, R1~R6, S1~S3）のロック（DayType問わず固定）
+                elif raw_t in SPECIAL_DUTIES:
+                    if internal_t in all_tasks:
+                        model.Add(x[p, d, internal_t] == 1)
+
+                # 3. Fixed (トレード対象外の日) なら初期配置のまま固定
+                elif d_type == 'Fixed':
                     if internal_t in all_tasks:
                         model.Add(x[p, d, internal_t] == 1)
 
