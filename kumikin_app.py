@@ -65,17 +65,17 @@ if check_password():
         members = df_members['MemberID'].tolist()
         member_home = df_members.set_index('MemberID')['BaseArea'].astype(str).str.strip().to_dict()
         
-        # Name 列のマッピング
-        has_name = 'Name' in df_members.columns
-        member_names = df_members.set_index('MemberID')['Name'].to_dict() if has_name else {}
+        # Name 列のマッピング（Member_Masterから取得）
+        has_name_in_master = 'Name' in df_members.columns
+        member_names = df_members.set_index('MemberID')['Name'].astype(str).str.strip().to_dict() if has_name_in_master else {}
 
-        # 職種(Role)のマッピング（小文字入力吸収のため .upper() 適用）
+        # 職種(Role)のマッピング
         if 'Role' in df_members.columns:
             member_role = df_members.set_index('MemberID')['Role'].astype(str).str.strip().str.upper().to_dict()
         else:
             member_role = {m: 'MC' for m in members}
 
-        # 性別(Gender)のマッピング（小文字入力吸収のため .upper() 適用）
+        # 性別(Gender)のマッピング
         if 'Gender' in df_members.columns:
             member_gender = df_members.set_index('MemberID')['Gender'].astype(str).str.strip().str.upper().to_dict()
         else:
@@ -104,7 +104,7 @@ if check_password():
         model = cp_model.CpModel()
         days = dates
         
-        # タスクマスターの準備（文字揃え・大文字化）
+        # タスクマスターの準備
         df_tasks['TaskID'] = df_tasks['TaskID'].astype(str).str.strip().str.upper()
         tasks_master = df_tasks.set_index('TaskID').to_dict('index')
         all_tasks = list(tasks_master.keys())
@@ -158,7 +158,7 @@ if check_password():
         # ハード制約1.6: 女性用宿泊設備なし仕業の割り当て禁止 (FemaleAllowed == 'N')
         for p in existing_members:
             p_gender = member_gender.get(p, 'M')
-            if p_gender == 'F':  # 女性メンバーの場合
+            if p_gender == 'F':
                 for t_id, t_info in tasks_master.items():
                     female_ok = str(t_info.get('FemaleAllowed', 'Y')).strip().upper()
                     if female_ok == 'N':
@@ -173,30 +173,23 @@ if check_password():
             converted_day_tasks = []
             for p in existing_members:
                 if not day_row.empty and p in day_row.columns:
-                    raw_t = str(day_row[p].values[0]).strip().upper()  # 小文字入力を大文字に統一
+                    raw_t = str(day_row[p].values[0]).strip().upper()
                 else:
                     raw_t = 'OFF'
                 
-                # 内部IDを取得
                 internal_t = disp_to_internal.get((raw_t, d_type), disp_to_internal.get((raw_t, 'All'), raw_t))
                 converted_day_tasks.append(internal_t)
                 
-                # 1. OFF のセルは絶対移動しないように固定（ロック）
                 if raw_t == 'OFF' or internal_t == 'OFF':
                     if 'OFF' in all_tasks:
                         model.Add(x[p, d, 'OFF'] == 1)
-
-                # 2. 特殊仕業（A1~A7, J1~J6, R1~R6, S1~S3）のロック
                 elif raw_t in SPECIAL_DUTIES:
                     if internal_t in all_tasks:
                         model.Add(x[p, d, internal_t] == 1)
-
-                # 3. Fixed (トレード対象外の日) なら初期配置のまま固定
                 elif d_type == 'Fixed':
                     if internal_t in all_tasks:
                         model.Add(x[p, d, internal_t] == 1)
 
-            # タスク数の維持
             for t in all_tasks:
                 count = converted_day_tasks.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == count)
@@ -223,7 +216,7 @@ if check_password():
         # 目的関数（ペナルティ項の最小化）
         penalty_terms = []
         
-        # 優先順位 1: 拠点ミスマッチペナルティ [重み: 1,000,000]
+        # 優先順位 1: 拠点ミスマッチペナルティ
         for p in existing_members:
             home_st = member_home.get(p, '')
             for d in days:
@@ -231,7 +224,7 @@ if check_password():
                     if str(t_info['TargetArea']).strip().upper() != str(home_st).strip().upper():
                         penalty_terms.append(x[p, d, t_id] * 1000000)
 
-        # 優先順位 2: Late-Early（おそはや）回避ペナルティ [重み: 1,000]
+        # 優先順位 2: Late-Early 回避ペナルティ
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -245,7 +238,7 @@ if check_password():
                                 model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
                                 penalty_terms.append(late_early * 1000)
 
-        # 優先順位 3: 負荷平準化ペナルティ [重み: 1]
+        # 優先順位 3: 負荷平準化ペナルティ
         for p in existing_members:
             p_diff = sum(x[p, d, t] * int(tasks_master[t]['Load']) for d in days for t in all_tasks)
             penalty_terms.append(p_diff)
@@ -281,14 +274,11 @@ if check_password():
             df_result_horiz = df_result_vert.set_index('Date').T.reset_index()
             df_result_horiz.rename(columns={'index': header_col}, inplace=True)
             
-            # Name 列が存在する場合は復元挿入
-            if has_name:
-                df_result_horiz.insert(1, 'Name', df_result_horiz[header_col].map(member_names).fillna(''))
+            # 💡【修正ポイント】MemberID(先頭列)の隣に Name 列を必ず挿入
+            df_result_horiz.insert(1, 'Name', df_result_horiz[header_col].map(member_names).fillna(''))
 
-            # 先頭に DayType 行を復元
-            day_type_output_row = {header_col: 'DayType'}
-            if has_name:
-                day_type_output_row['Name'] = ''
+            # 先頭に DayType 行を復元（Name列の箇所は空欄にする）
+            day_type_output_row = {header_col: 'DayType', 'Name': ''}
             for d in days:
                 day_type_output_row[d] = day_type_map.get(d, '')
             
