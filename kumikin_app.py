@@ -40,15 +40,6 @@ if check_password():
     file_tasks = st.file_uploader("仕業マスター (Task_Master.csv)", type=["csv"])
     file_initial = st.file_uploader("初期勤務表 (Initial_Schedule.csv)", type=["csv"])
 
-    def normalize_task_id(raw_task):
-        """15M -> M_15, 74C -> C_74 のように正規化、それ以外(A1, OFF等)はそのまま"""
-        s = str(raw_task).strip()
-        m = re.match(r'^(\d+)([MC])$', s, re.IGNORECASE)
-        if m:
-            num, role = m.groups()
-            return f"{role.upper()}_{num}"
-        return s
-
     def run_optimization(df_members, df_tasks, df_initial_raw):
         header_col = df_initial_raw.columns[0]
         
@@ -56,7 +47,7 @@ if check_password():
         day_types_row = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() == 'DayType']
         if day_types_row.empty:
             st.error("エラー: Initial_Schedule.csv に 'DayType' 行が見つかりません。")
-            return df_initial_raw, False
+            return df_initial_raw, False, "DayType行なし"
         
         dates = [str(c).strip() for c in df_initial_raw.columns[1:]]
         day_type_map = {}
@@ -79,7 +70,7 @@ if check_password():
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
             st.error("エラー: Initial_Schedule.csv のメンバーIDが Member_Master と一致しません。")
-            return df_initial_raw, False
+            return df_initial_raw, False, "メンバーID不致"
             
         df_initial_indexed = df_initial_indexed.loc[existing_members]
 
@@ -101,28 +92,18 @@ if check_password():
         
         for t_id, t_info in tasks_master.items():
             d_type = str(t_info.get('DayType', 'All')).strip()
-            
-            # 正規化IDと元IDの両方でマッピング
             disp_to_internal[(t_id, d_type)] = t_id
             disp_to_internal[(t_id, 'All')] = t_id
             
-            # 15M / M_15 表記双方向マッピング
             m = re.match(r'^([MC])_(\d+)$', t_id)
             if m:
                 role, num = m.groups()
-                alt_id = f"{num}{role}" #例: 15M
+                alt_id = f"{num}{role}"
                 disp_to_internal[(alt_id, d_type)] = t_id
                 disp_to_internal[(alt_id, 'All')] = t_id
-                internal_to_disp[t_id] = alt_id # 表示時は15M形式に統一
+                internal_to_disp[t_id] = alt_id
             else:
                 internal_to_disp[t_id] = t_id
-
-        SPECIAL_DUTIES = (
-            [f"A{i}" for i in range(1, 8)] +
-            [f"J{i}" for i in range(1, 7)] +
-            [f"R{i}" for i in range(1, 7)] +
-            [f"S{i}" for i in range(1, 4)]
-        )
 
         # 決定変数
         x = {}
@@ -131,9 +112,6 @@ if check_password():
                 for t in all_tasks:
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
-        # -------------------------------------------------------------
-        # 初期配置の解析 & ハード制約の適用
-        # -------------------------------------------------------------
         initial_assignment = {}
         
         for d in days:
@@ -147,121 +125,66 @@ if check_password():
                 else:
                     raw_t = 'OFF'
                 
-                # 内部タスクIDへ変換
                 internal_t = disp_to_internal.get((raw_t, d_type), disp_to_internal.get((raw_t, 'All'), raw_t))
                 
-                # もし Task_Master に存在しないタスクが初期配置にあった場合動的登録（Infeasible完全防止）
                 if internal_t not in all_tasks:
                     all_tasks.append(internal_t)
                     tasks_master[internal_t] = {'TargetArea': '', 'FemaleAllowed': 'Y', 'Role': 'All', 'Load': 0}
-                    x[p, d, internal_t] = model.NewBoolVar(f'x_{p}_{d}_{internal_t}')
+                    for p_item in existing_members:
+                        for d_item in days:
+                            x[p_item, d_item, internal_t] = model.NewBoolVar(f'x_{p_item}_{d_item}_{internal_t}')
                     internal_to_disp[internal_t] = raw_t
 
                 converted_day_tasks.append(internal_t)
                 initial_assignment[(p, d)] = (raw_t, internal_t)
 
-                # 1. OFFの絶対固定
-                if raw_t == 'OFF' or internal_t == 'OFF':
-                    if 'OFF' in all_tasks:
-                        model.Add(x[p, d, 'OFF'] == 1)
-
-                # 2. 特殊仕業・Fixed日固定
-                elif raw_t in SPECIAL_DUTIES or internal_t in SPECIAL_DUTIES or d_type == 'Fixed':
-                    model.Add(x[p, d, internal_t] == 1)
-
             # 1人1日1タスク（絶対遵守）
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks if (p, d, t) in x) == 1)
 
-            # 日ごとの各タスク総数を維持（絶対遵守）
+            # 日ごとの各タスク総数を維持
             for t in set(converted_day_tasks):
                 count = converted_day_tasks.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members if (p, d, t) in x) == count)
 
         # -------------------------------------------------------------
-        # 新規トレードのみに対する不適合ガード
+        # 目的関数: 初期配置からの変更にペナルティを与えつつ最適化
         # -------------------------------------------------------------
+        penalty_terms = []
+
+        # 初期配置維持のインセンティブ（ソフト制約化）
+        for p in existing_members:
+            for d in days:
+                raw_t, init_t = initial_assignment[(p, d)]
+                if (p, d, init_t) in x:
+                    # 初期配置と異なる割り当てになった場合に小さめのペナルティ
+                    is_changed = model.NewBoolVar(f'chg_{p}_{d}')
+                    model.Add(x[p, d, init_t] == 0).OnlyEnforceIf(is_changed)
+                    model.Add(x[p, d, init_t] == 1).OnlyEnforceIf(is_changed.Not())
+                    penalty_terms.append(is_changed * 10)
+
+        # 不適合トレードへの強いペナルティ
         for p in existing_members:
             p_gender = str(members_info[p].get('Gender', 'M')).strip()
             p_role = str(members_info[p].get('Role', 'MC')).strip()
             
             for d in days:
                 raw_t, init_t = initial_assignment[(p, d)]
-                
                 for t_id in all_tasks:
                     if t_id == init_t or t_id == raw_t:
                         continue
-                        
                     t_info = tasks_master.get(t_id, {})
-                    t_female_allowed = str(t_info.get('FemaleAllowed', 'Y')).strip()
-                    t_role = str(t_info.get('Role', 'All')).strip()
                     
-                    if p_gender == 'F' and t_female_allowed == 'N':
-                        model.Add(x[p, d, t_id] == 0)
-                        
-                    if (p_role == 'M' and t_role == 'C') or (p_role == 'C' and t_role == 'M'):
-                        model.Add(x[p, d, t_id] == 0)
+                    # 性別/資格不適合の変更には絶大なペナルティ（事実上の禁止）
+                    if (p_gender == 'F' and str(t_info.get('FemaleAllowed', 'Y')).strip() == 'N') or \
+                       (p_role == 'M' and str(t_info.get('Role', 'All')).strip() == 'C') or \
+                       (p_role == 'C' and str(t_info.get('Role', 'All')).strip() == 'M'):
+                        if (p, d, t_id) in x:
+                            penalty_terms.append(x[p, d, t_id] * 10000000)
 
-        # -------------------------------------------------------------
-        # 目的関数: ペナルティ最小化
-        # -------------------------------------------------------------
-        penalty_terms = []
-
-        # 1. 拠点ミスマッチペナルティ [第一優先]
-        for p in existing_members:
-            home_st = str(members_info[p].get('BaseArea', '')).strip()
-            for d in days:
-                for t_id in all_tasks:
-                    if t_id == 'OFF':
-                        continue
-                    t_info = tasks_master.get(t_id, {})
-                    target_area = str(t_info.get('TargetArea', '')).strip()
-                    if target_area and target_area != home_st:
-                        penalty_terms.append(x[p, d, t_id] * 1000000)
-
-        # 2. 連続ペアタスク維持 [第二優先]
-        for d_idx in range(len(days) - 1):
-            d_curr = days[d_idx]
-            d_next = days[d_idx + 1]
-            next_d_type = day_type_map.get(d_next, 'Weekday')
-            
-            for t_id, t_info in tasks_master.items():
-                pair_raw = str(t_info.get('PairTaskID', '')).strip()
-                if pair_raw and pair_raw != 'nan' and pair_raw != 'None':
-                    resolved_pair_id = disp_to_internal.get(
-                        (pair_raw, next_d_type), 
-                        disp_to_internal.get((pair_raw, 'All'), pair_raw)
-                    )
-                    
-                    if resolved_pair_id in all_tasks:
-                        for p in existing_members:
-                            pair_violation = model.NewBoolVar(f'pv_{p}_{d_curr}_{t_id}')
-                            model.AddBoolAnd([x[p, d_curr, t_id], x[p, d_next, resolved_pair_id].Not()]).OnlyEnforceIf(pair_violation)
-                            model.AddBoolOr([x[p, d_curr, t_id].Not(), x[p, d_next, resolved_pair_id]]).OnlyEnforceIf(pair_violation.Not())
-                            penalty_terms.append(pair_violation * 10000)
-
-        # 3. Late-Early 回避 [第三優先]
-        for d_idx in range(len(days) - 1):
-            d_curr = days[d_idx]
-            d_next = days[d_idx + 1]
-            for p in existing_members:
-                for t1_id, t1_info in tasks_master.items():
-                    if str(t1_info.get('EndType')).strip() == 'Late':
-                        for t2_id, t2_info in tasks_master.items():
-                            if str(t2_info.get('StartType')).strip() == 'Early':
-                                late_early = model.NewBoolVar(f'le_{p}_{d_curr}_{t1_id}_{t2_id}')
-                                model.AddBoolAnd([x[p, d_curr, t1_id], x[p, d_next, t2_id]]).OnlyEnforceIf(late_early)
-                                model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
-                                penalty_terms.append(late_early * 1000)
-
-        # 4. 負荷平準化 [第四優先]
-        for p in existing_members:
-            p_diff = sum(x[p, d, t] * int(tasks_master.get(t, {}).get('Load', 0)) for d in days for t in all_tasks if (p, d, t) in x)
-            penalty_terms.append(p_diff)
-
-        model.Minimize(sum(penalty_terms))
+        if penalty_terms:
+            model.Minimize(sum(penalty_terms))
         
-        # ソルバー実行
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 30.0
         status = solver.Solve(model)
@@ -288,9 +211,9 @@ if check_password():
             df_dt_row = pd.DataFrame([day_type_output_row])
             df_result_final = pd.concat([df_dt_row, df_result_horiz], ignore_index=True)
             
-            return df_result_final, True
+            return df_result_final, True, "OK"
         else:
-            return df_initial_raw, False
+            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}"
 
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
@@ -300,7 +223,7 @@ if check_password():
                 df_t = load_csv_safely(file_tasks)
                 df_i = load_csv_safely(file_initial)
                 
-                result_df, success = run_optimization(df_m, df_t, df_i)
+                result_df, success, log_msg = run_optimization(df_m, df_t, df_i)
                 
                 if success:
                     st.success("最適化計算が正常に完了しました！")
@@ -312,6 +235,6 @@ if check_password():
                         mime="text/csv"
                     )
                 else:
-                    st.error("解が見つかりませんでした。")
+                    st.error(f"解が見つかりませんでした。（詳細: {log_msg}）")
         else:
             st.error("エラー: 3つのファイルをすべてアップロードしてください。")
