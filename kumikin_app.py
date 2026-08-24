@@ -36,7 +36,7 @@ def clean_str(val):
 
 if check_password():
     st.title("勤務変更補助システム")
-    st.caption("自動シフトトレード・制約最適化ソルバー")
+    st.caption("自動シフトトレード・制約最適化ソルバー（デバッグモード）")
 
     st.subheader("1. データファイルのアップロード")
     file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"])
@@ -49,7 +49,7 @@ if check_password():
         day_types_row = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() == 'DayType']
         if day_types_row.empty:
             st.error("エラー: Initial_Schedule.csv に 'DayType' 行が見つかりません。")
-            return df_initial_raw, False, "DayType行なし", [], []
+            return df_initial_raw, False, "DayType行なし", [], [], []
         
         dates = [clean_str(c) for c in df_initial_raw.columns[1:]]
         day_type_map = {}
@@ -70,7 +70,7 @@ if check_password():
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
             st.error("エラー: Initial_Schedule.csv のメンバーIDが Member_Master と一致しません。")
-            return df_initial_raw, False, "メンバーID不一致", [], []
+            return df_initial_raw, False, "メンバーID不一致", [], [], []
             
         df_initial_indexed = df_initial_indexed.loc[existing_members]
 
@@ -190,16 +190,13 @@ if check_password():
                     if (p_role == 'M' and t_role == 'C') or (p_role == 'C' and t_role == 'M'):
                         model.Add(x[p, d, t_id] == 0)
 
-        # -------------------------------------------------------------
-        # ペア仕業（一泊二日）のハード制約（★初期シフトに存在するタスクのみに限定フィルタリング）
-        # -------------------------------------------------------------
+        # ペア仕業（一泊二日）のハード制約
         pair_debug_logs = []
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
             next_d_type = day_type_map.get(d_next, 'Weekday')
             
-            # その日実際に存在するタスクのみを対象にする
             active_tasks_today = set(day_converted_tasks[d_curr])
             
             for t_id in active_tasks_today:
@@ -216,33 +213,42 @@ if check_password():
                     )
                     
                     if resolved_pair_id in all_tasks:
-                        pair_debug_logs.append(f"【有効ペア適用】{internal_to_disp.get(t_id, t_id)} ({d_curr}) ➔ {internal_to_disp.get(resolved_pair_id, resolved_pair_id)} ({d_next})")
+                        pair_debug_logs.append(f"【ペア制約適用】{internal_to_disp.get(t_id, t_id)} ({d_curr}) ➔ {internal_to_disp.get(resolved_pair_id, resolved_pair_id)} ({d_next})")
                         for p in existing_members:
                             model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
         # -------------------------------------------------------------
-        # 目的関数（拠点マッチング評価）
+        # 目的関数 ＆ デバッグデータ収集
         # -------------------------------------------------------------
         penalty_terms = []
+        score_debug_logs = []
 
         for p in existing_members:
-            home_st = clean_str(members_info[p].get('BaseArea', '')).lower()
+            home_st = clean_str(members_info[p].get('BaseArea', '')).strip()
             for d in days:
+                raw_t, orig_int = initial_assignment[(p, d)]
+                if orig_int == 'OFF':
+                    continue
+                
+                t_info = tasks_master.get(orig_int, {})
+                target_area = clean_str(t_info.get('TargetArea', '')).strip()
+                
+                score_debug_logs.append(
+                    f"【初期状態診断】{d} メンバー:{p}(所属:{home_st}) ➔ 担当仕業:{raw_t}(TargetArea:'{target_area}')"
+                )
+
                 for t_id in all_tasks:
                     if t_id == 'OFF':
                         continue
-                    t_info = tasks_master.get(t_id, {})
-                    target_area = clean_str(t_info.get('TargetArea', '')).lower()
+                    t_info_curr = tasks_master.get(t_id, {})
+                    t_target = clean_str(t_info_curr.get('TargetArea', '')).strip()
                     
-                    if home_st and target_area:
-                        if target_area != home_st:
-                            # 拠点ミスマッチ（ペナルティ 1,000点）
+                    if home_st and t_target:
+                        if t_target.lower() != home_st.lower():
                             penalty_terms.append(x[p, d, t_id] * 1000)
                         else:
-                            # 拠点適合（ボーナス -100点）
                             penalty_terms.append(x[p, d, t_id] * (-100))
 
-        # トレード抑制タイブレーク（1点）
         for d in days:
             for p in existing_members:
                 _, orig_int = initial_assignment[(p, d)]
@@ -292,9 +298,9 @@ if check_password():
             df_dt_row = pd.DataFrame([day_type_output_row])
             df_result_final = pd.concat([df_dt_row, df_result_horiz], ignore_index=True)
             
-            return df_result_final, True, "OK", change_logs, pair_debug_logs
+            return df_result_final, True, "OK", change_logs, pair_debug_logs, score_debug_logs
         else:
-            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], pair_debug_logs
+            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], pair_debug_logs, score_debug_logs
 
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
@@ -304,7 +310,7 @@ if check_password():
                 df_t = load_csv_safely(file_tasks)
                 df_i = load_csv_safely(file_initial)
                 
-                result_df, success, log_msg, change_logs, pair_debug_logs = run_optimization(df_m, df_t, df_i)
+                result_df, success, log_msg, change_logs, pair_debug_logs, score_debug_logs = run_optimization(df_m, df_t, df_i)
                 
                 if success:
                     st.success("最適化計算が正常に完了しました！")
@@ -316,9 +322,13 @@ if check_password():
                     else:
                         st.info("ℹ️ 条件を満たす効果的なトレードが存在しなかったため、無駄な変更を行わず初期シフトを維持しました。")
 
-                    with st.expander("🔍 実際に適用されたペア制約（デバッグ用）"):
+                    with st.expander("🔍 適用されたペア制約ログ"):
                         for p_log in list(set(pair_debug_logs)):
                             st.write(p_log)
+
+                    with st.expander("🔍 初期シフトの拠点マッチング診断ログ（重要）"):
+                        for s_log in score_debug_logs[:20]:
+                            st.write(s_log)
 
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                     st.download_button(
