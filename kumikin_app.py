@@ -194,7 +194,7 @@ if check_password():
         # -------------------------------------------------------------
         penalty_terms = []
 
-        # 1. 拠点ミスマッチペナルティ [重み: 1,000,000点]
+        # 1. 拠点ミスマッチペナルティ [最優先: 1,000,000点]
         for p in existing_members:
             home_st = clean_str(members_info[p].get('BaseArea', ''))
             for d in days:
@@ -206,7 +206,7 @@ if check_password():
                     if target_area and home_st and target_area != home_st:
                         penalty_terms.append(x[p, d, t_id] * 1000000)
 
-        # 2. 連続ペアタスク違反 [重み: 100,000点]
+        # 2. 連続ペアタスク違反 [優先度高: 100,000点]
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -227,7 +227,7 @@ if check_password():
                             model.AddBoolOr([x[p, d_curr, t_id].Not(), x[p, d_next, resolved_pair_id]]).OnlyEnforceIf(pair_violation.Not())
                             penalty_terms.append(pair_violation * 100000)
 
-        # 3. Late-Early (遅番→早番) 回避 [重み: 1,000点]
+        # 3. Late-Early (遅番→早番) 回避 [優先度中: 1,000点]
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -240,16 +240,6 @@ if check_password():
                                 model.AddBoolAnd([x[p, d_curr, t1_id], x[p, d_next, t2_id]]).OnlyEnforceIf(late_early)
                                 model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
                                 penalty_terms.append(late_early * 1000)
-
-        # 4. トレード微小コスト（無意味な変更の抑制: 1点）
-        for p in existing_members:
-            for d in days:
-                raw_t, init_t = initial_assignment[(p, d)]
-                if (p, d, init_t) in x:
-                    is_changed = model.NewBoolVar(f'chg_{p}_{d}')
-                    model.Add(x[p, d, init_t] == 0).OnlyEnforceIf(is_changed)
-                    model.Add(x[p, d, init_t] == 1).OnlyEnforceIf(is_changed.Not())
-                    penalty_terms.append(is_changed * 1)
 
         if penalty_terms:
             model.Minimize(sum(penalty_terms))
