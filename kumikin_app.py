@@ -63,7 +63,7 @@ def normalize_task_id(t_str):
 
 if check_password():
     st.title("勤務変更補助システム")
-    st.caption("自動シフトトレード・制約最適化ソルバー（診断機能付き）")
+    st.caption("自動シフトトレード・制約最適化ソルバー")
 
     st.subheader("1. データファイルのアップロード")
     file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"])
@@ -206,7 +206,7 @@ if check_password():
                 count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == count)
 
-        # 属性制約（判定を柔軟に修正）
+        # 属性制約
         for p in existing_members:
             p_gender = clean_str(members_info[p].get('Gender', 'M')).upper()
             p_role = clean_str(members_info[p].get('Role', 'MC')).upper()
@@ -222,40 +222,43 @@ if check_password():
                     if p_gender == 'F' and t_female_allowed == 'N':
                         model.Add(x[p, d, t_id] == 0)
                         
-                    # MC表記（両対応）に対応
                     if p_role != 'MC' and t_role not in ['ALL', '']:
                         if p_role == 'M' and t_role == 'C':
                             model.Add(x[p, d, t_id] == 0)
                         elif p_role == 'C' and t_role == 'M':
                             model.Add(x[p, d, t_id] == 0)
 
-        # ペア仕業（一泊二日）のハード制約
+        # -------------------------------------------------------------
+        # ペア仕業（一泊二日）のハード制約【正方向（当日➔翌日）修正版】
+        # -------------------------------------------------------------
         pair_debug_logs = []
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
             next_d_type = day_type_map.get(d_next, 'Weekday')
             
-            for p_today in existing_members:
-                _, t_curr = initial_assignment[(p_today, d_curr)]
+            # 当日(d_curr)に存在する全仕業について判定
+            for t_curr in all_tasks:
                 if t_curr == 'OFF':
                     continue
                 
                 t_info = tasks_master.get(t_curr, {})
                 pair_raw = clean_str(t_info.get('PairTaskID', ''))
                 
+                # PairTaskIDが指定されている場合のみ（例: 39MのPairTaskIDは40）
                 if pair_raw and pair_raw not in ['nan', 'None', '']:
                     curr_role = t_info.get('Role', 'M')
                     pair_resolved = resolve_task_id(f"{pair_raw}{curr_role}", next_d_type)
                     
                     if pair_resolved in all_tasks:
                         pair_debug_logs.append(
-                            f"【ペア制約適用】{get_disp_name(t_curr)} ({d_curr}) ➔ {get_disp_name(pair_resolved)} ({d_next})"
+                            f"【ペア制約適用】{get_disp_name(t_curr)} ({d_curr}) ➔ 翌日必ず {get_disp_name(pair_resolved)} ({d_next})"
                         )
+                        # 当日t_currを行うメンバーは、翌日必ずpair_resolvedを行わなければならない
                         for p in existing_members:
                             model.Add(x[p, d_curr, t_curr] == x[p, d_next, pair_resolved])
 
-        # 目的関数
+        # 目的関数（拠点不一致ペナルティ & トレードインセンティブ）
         penalty_terms = []
         score_debug_logs = []
 
@@ -268,10 +271,6 @@ if check_password():
                 
                 t_info = tasks_master.get(orig_resolved, {})
                 target_area = clean_str(t_info.get('TargetArea', '')).strip()
-                
-                score_debug_logs.append(
-                    f"【初期状態】{d} {p}(所属:{home_st}) ➔ {raw_t}(ID:{orig_resolved}, Area:'{target_area}')"
-                )
 
                 for t_id in all_tasks:
                     if t_id == 'OFF':
@@ -285,11 +284,13 @@ if check_password():
                         else:
                             penalty_terms.append(x[p, d, t_id] * (-100))
 
+        # トレードを促すためのスコア調整（変更することへの小さなインセンティブ）
         for d in dates:
             for p in existing_members:
                 _, orig_resolved = initial_assignment[(p, d)]
-                if orig_resolved in all_tasks:
-                    penalty_terms.append((1 - x[p, d, orig_resolved]) * 1)
+                if orig_resolved in all_tasks and orig_resolved != 'OFF':
+                    # 元の仕業を維持したら +1 ペナルティ（＝トレードした方がスコアが良くなる）
+                    penalty_terms.append(x[p, d, orig_resolved] * 1)
 
         if penalty_terms:
             model.Minimize(sum(penalty_terms))
@@ -360,10 +361,10 @@ if check_password():
                         for log in change_logs:
                             st.write(log)
                     else:
-                        st.info("ℹ️ 初期シフトで既に最適か、交換可能なペアが存在しませんでした。")
+                        st.info("ℹ️ 条件を満たす効果的なトレードが存在しなかったため、初期シフトを維持しました。")
 
                     with st.expander("🔍 適用されたペア制約ログ"):
-                        for p_log in list(set(pair_debug_logs)):
+                        for p_log in sorted(list(set(pair_debug_logs))):
                             st.write(p_log)
 
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
@@ -376,10 +377,7 @@ if check_password():
                 else:
                     st.error(f"解が見つかりませんでした。（詳細: {log_msg}）")
                     with st.expander("🔍 デバッグログ（ペア制約の適用状況）"):
-                        for p_log in list(set(pair_debug_logs)):
+                        for p_log in sorted(list(set(pair_debug_logs))):
                             st.write(p_log)
-                    with st.expander("🔍 デバッグログ（初期勤務のマッチング状況）"):
-                        for s_log in score_debug_logs:
-                            st.write(s_log)
         else:
             st.error("エラー: 3つのファイルをすべてアップロードしてください。")
