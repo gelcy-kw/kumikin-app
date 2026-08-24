@@ -117,11 +117,10 @@ if check_password():
             [f"S{i}" for i in range(1, 4)]
         )
 
-        # 決定変数の事前生成用集合
         initial_assignment = {}
         day_converted_tasks = {d: [] for d in days}
 
-        # 事前スキャン：すべての（メンバー, 日）について初期内部タスクを特定し、不足タスクがあれば補完
+        # 初期内部タスクを特定
         for d in days:
             d_type = day_type_map.get(d, 'Weekday')
             day_row = df_initial_shift[df_initial_shift['Date'] == d]
@@ -167,7 +166,7 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-            # 日ごとの各タスク総数を維持
+            # 日ごとの各タスク総数を維持（全体枠の保存）
             tasks_today = day_converted_tasks[d]
             for t in set(tasks_today):
                 count = tasks_today.count(t)
@@ -195,7 +194,7 @@ if check_password():
         # -------------------------------------------------------------
         penalty_terms = []
 
-        # 1. 拠点ミスマッチペナルティ [重み: 100,000点]
+        # 1. 拠点ミスマッチペナルティ [重み: 1,000,000点]
         for p in existing_members:
             home_st = clean_str(members_info[p].get('BaseArea', ''))
             for d in days:
@@ -205,9 +204,9 @@ if check_password():
                     t_info = tasks_master.get(t_id, {})
                     target_area = clean_str(t_info.get('TargetArea', ''))
                     if target_area and home_st and target_area != home_st:
-                        penalty_terms.append(x[p, d, t_id] * 100000)
+                        penalty_terms.append(x[p, d, t_id] * 1000000)
 
-        # 2. 連続ペアタスク違反 [重み: 10,000点]
+        # 2. 連続ペアタスク違反 [重み: 100,000点]
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -226,7 +225,7 @@ if check_password():
                             pair_violation = model.NewBoolVar(f'pv_{p}_{d_curr}_{t_id}')
                             model.AddBoolAnd([x[p, d_curr, t_id], x[p, d_next, resolved_pair_id].Not()]).OnlyEnforceIf(pair_violation)
                             model.AddBoolOr([x[p, d_curr, t_id].Not(), x[p, d_next, resolved_pair_id]]).OnlyEnforceIf(pair_violation.Not())
-                            penalty_terms.append(pair_violation * 10000)
+                            penalty_terms.append(pair_violation * 100000)
 
         # 3. Late-Early (遅番→早番) 回避 [重み: 1,000点]
         for d_idx in range(len(days) - 1):
