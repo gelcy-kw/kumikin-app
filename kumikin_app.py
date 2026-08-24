@@ -35,6 +35,16 @@ def clean_str(val):
         return ""
     return str(val).strip().upper()
 
+def normalize_area(area_str):
+    a = clean_str(area_str)
+    if 'AKAIKE' in a or '赤池' in a:
+        return 'AKAIKE'
+    if 'JOSHIN' in a or '上小田井' in a or 'JOSIN' in a:
+        return 'JOSHIN'
+    if 'MEIKO' in a or '名港' in a:
+        return 'MEIKO'
+    return a if a else 'ANY'
+
 def is_fixed_task(task_code):
     """
     OFF または アルファベットから始まる特殊仕業（A1-A7, J1-J6, R1-R6, S1-S3等）を
@@ -70,7 +80,7 @@ if check_password():
         
         for _, row in df_members.iterrows():
             m_id = clean_str(row['MemberID'])
-            area = clean_str(row.get('BaseArea', ''))
+            area = normalize_area(row.get('BaseArea', ''))
             role = clean_str(row.get('Role', ''))
             gender = clean_str(row.get('Gender', ''))
             
@@ -81,27 +91,47 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 2. 仕業マスターのパース（TargetAreaの正確なマッピング）
+        # 2. 仕業マスターのパース（全表記パターンの網羅）
         # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
+        pair_rules = {}
 
         if 'TaskID' in df_tasks.columns:
             for _, row in df_tasks.iterrows():
                 t_id = clean_str(row['TaskID'])
-                t_area = clean_str(row.get('TargetArea', ''))
+                t_area = normalize_area(row.get('TargetArea', ''))
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
-                
+                pair_id = clean_str(row.get('PairTaskID', ''))
+
+                # 原本のTaskID（例: M_1_W, A1, J1 など）を登録
                 task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
+
+                # M_1_W や C_1_W から "1M" や "1C" 形式への分解登録
+                m_match = re.match(r'([MC])_(\d+)_[WH]', t_id)
+                if not m_match:
+                    m_match = re.match(r'([MC])_(\d+)', t_id)
                 
-                m_underscore = re.match(r'([MC])_(\d+)', t_id)
-                if m_underscore:
-                    prefix = m_underscore.group(1)
-                    num = m_underscore.group(2)
-                    plain_id = f"{num}{prefix}"
+                if m_match:
+                    role_char = m_match.group(1)
+                    num_str = m_match.group(2)
+                    plain_id = f"{num_str}{role_char}"  # 例: 1M, 1C
+                    
                     task_area_map[plain_id] = t_area
                     task_female_allowed_map[plain_id] = f_allowed
+
+                    # ペア仕業の解析 (例: PairTaskIDが "4" で自身が M_5_W なら 4M -> 5M)
+                    if pair_id and pair_id.isdigit():
+                        prev_plain_id = f"{pair_id}{role_char}"
+                        pair_rules[prev_plain_id] = plain_id
+
+        # 特殊仕業・固定仕業の自動ペア登録 (A4->A5, A6->A7, J3->J4, J5->J6, R3->R4, R5->R6, S2->S3)
+        for _, row in df_tasks.iterrows():
+            t_id = clean_str(row['TaskID'])
+            pair_id = clean_str(row.get('PairTaskID', ''))
+            if pair_id and not pair_id.isdigit():
+                pair_rules[pair_id] = t_id
 
         def get_task_area(task_code):
             if is_fixed_task(task_code):
@@ -142,21 +172,6 @@ if check_password():
 
         all_tasks = list(all_tasks_set)
 
-        pair_rules = {
-            "11C": "12C", "11M": "12M",
-            "15C": "16C", "15M": "16M",
-            "18C": "19C", "18M": "19M",
-            "25C": "26C", "25M": "26M",
-            "32C": "33C", "32M": "33M",
-            "39C": "40C", "39M": "40M",
-            "46C": "47C", "46M": "47M",
-            "53C": "54C", "53M": "54M",
-            "4C":  "5C",  "4M":  "5M",
-            "60C": "61C", "60M": "61M",
-            "67C": "68C", "67M": "68M",
-            "74C": "75C", "74M": "75M"
-        }
-
         model = cp_model.CpModel()
         x = {}
         for p in existing_members:
@@ -173,7 +188,7 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 2. OFF および 特殊仕業の絶対固定制約
+        # 2. OFF および 特殊仕業（A1..J1..等）の絶対固定制約
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
@@ -183,10 +198,10 @@ if check_password():
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, orig_t] == 1)
 
-        # 3. 所属エリア一致制約（他エリアの仕業割り当てを絶対禁止！）
+        # 3. 所属エリア一致制約（厳格ガード）
         for p in existing_members:
-            p_base_area = member_base_area.get(p, '')
-            if not p_base_area or p_base_area == 'ANY':
+            p_base_area = member_base_area.get(p, 'ANY')
+            if p_base_area == 'ANY':
                 continue
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
@@ -194,8 +209,8 @@ if check_password():
                     if is_fixed_task(t):
                         continue
                     t_area = get_task_area(t)
-                    # 初期シフトで元々割り当たっていない他エリアの仕業は禁止
-                    if t_area and t_area != 'ANY' and t_area != p_base_area:
+                    # メンバー所属エリアと仕業エリアが異なり、かつ初期シフトでも無かった場合は禁止
+                    if t_area != 'ANY' and t_area != p_base_area:
                         if t != orig_t:
                             model.Add(x[p, d, t] == 0)
 
@@ -321,7 +336,7 @@ if check_password():
                         for clog in change_logs:
                             st.write(clog)
                     else:
-                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした。")
+                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（制約を完全に満たしています）")
 
                     with st.expander("🔍 適用されたペア制約ログ"):
                         for p_log in sorted(list(set(pair_debug_logs))):
