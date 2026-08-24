@@ -107,14 +107,25 @@ if check_password():
                 task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
 
-                # 4M などの表記と PairTaskID の紐付け
-                m_match = re.match(r'([MC])_(\d+)_[WH]', t_id)
-                if not m_match:
-                    m_match = re.match(r'([MC])_(\d+)', t_id)
-                
+                # 4M / 15M などの数値＋末尾アルファベット形式の対応
+                m_match = re.match(r'^(\d+)([MC])$', t_id)
                 if m_match:
-                    role_char = m_match.group(1)
-                    num_str = m_match.group(2)
+                    num_str = m_match.group(1)
+                    role_char = m_match.group(2)
+                    task_area_map[t_id] = t_area
+                    task_female_allowed_map[t_id] = f_allowed
+
+                    if pair_id and pair_id.isdigit():
+                        prev_plain_id = f"{pair_id}{role_char}"
+                        pair_rules[prev_plain_id] = t_id
+
+                # 詳細ID（MC_4_W等）形式への対応
+                m_match_long = re.match(r'([MC])_(\d+)_[WH]', t_id)
+                if not m_match_long:
+                    m_match_long = re.match(r'([MC])_(\d+)', t_id)
+                if m_match_long:
+                    role_char = m_match_long.group(1)
+                    num_str = m_match_long.group(2)
                     plain_id = f"{num_str}{role_char}"
                     
                     task_area_map[plain_id] = t_area
@@ -124,7 +135,7 @@ if check_password():
                         prev_plain_id = f"{pair_id}{role_char}"
                         pair_rules[prev_plain_id] = plain_id
 
-        # 特殊仕業ペアの登録（TaskID指定）
+        # 特殊仕業ペアの登録
         for _, row in df_tasks.iterrows():
             t_id = clean_str(row['TaskID'])
             pair_id = clean_str(row.get('PairTaskID', ''))
@@ -238,24 +249,22 @@ if check_password():
                     for p in existing_members:
                         model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
-        # 7. 【絶対禁忌】他エリア仕業への新規割り当て禁止（ハード制約化）
-        # トレードによって「自エリア以外の仕業」が新たに割り当てられることを一切許可しない
+        # 7. 【絶対禁忌】自エリア以外の仕業の割り当て禁止
+        # メンバーの所属エリアと仕業の対象エリアが一致しない組み合わせはすべて禁止(0)
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
             if p_base_area != 'ANY':
                 for d in dates:
-                    orig_t = initial_assignment.get((p, d), 'OFF')
                     for t in all_tasks:
                         if is_fixed_task(t):
                             continue
                         t_area = get_task_area(t)
-                        # 変更先の仕業が自エリアと異なり、かつ初期シフトと違う場合は割り当て禁止(0)
-                        if t_area != 'ANY' and t_area != p_base_area and t != orig_t:
+                        # 仕業エリアが特定されており、かつメンバーの自エリアと異なる場合は割り当て不可
+                        if t_area != 'ANY' and t_area != p_base_area:
                             model.Add(x[p, d, t] == 0)
 
         # -------------------------------------------------------------
-        # 目的関数: 変更（トレード）回数の最小化のみ
-        # （不適切な割り当てはすべてハード制約でブロック済）
+        # 目的関数: 変更（トレード）回数の最小化
         # -------------------------------------------------------------
         objective_terms = []
 
