@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import re
-from datetime import datetime, timedelta
 from ortools.sat.python import cp_model
 
 # ページ基本設定
@@ -50,14 +49,7 @@ if check_password():
         header_col = df_initial_raw.columns[0]
         
         day_types_row = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() == 'DayType']
-        if day_types_row.empty:
-            return df_initial_raw, False, "DayType行なし", [], [], [], []
-        
         dates = [clean_str(c) for c in df_initial_raw.columns[1:]]
-        day_type_map = {}
-        for col in df_initial_raw.columns[1:]:
-            col_str = clean_str(col)
-            day_type_map[col_str] = clean_str(day_types_row[col].values[0])
 
         df_members['MemberID'] = df_members['MemberID'].apply(clean_str)
         members_info = df_members.set_index('MemberID').to_dict('index')
@@ -74,7 +66,7 @@ if check_password():
             return df_initial_raw, False, "メンバーID不一致", [], [], [], []
 
         # -------------------------------------------------------------
-        # 初期勤務表の取得と辞書化
+        # 初期勤務表の取得と全仕業のリスト化
         # -------------------------------------------------------------
         initial_assignment = {}
         all_tasks_set = set(['OFF'])
@@ -88,9 +80,7 @@ if check_password():
 
         all_tasks = list(all_tasks_set)
 
-        # -------------------------------------------------------------
-        # ペア制約の正しく向けられた定義（1日目 ➔ 2日目）
-        # -------------------------------------------------------------
+        # ペア制約ルールの定義（1日目 ➔ 2日目）
         pair_rules = {
             "11C": "12C", "11M": "12M",
             "15C": "16C", "15M": "16M",
@@ -113,13 +103,20 @@ if check_password():
                 for t in all_tasks:
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
-        # 1人1日1つの仕業
+        # 制約1: 1人1日1仕業
         for d in dates:
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
+        # 制約2: 各日に必要な仕業の人数（需要数）を元データから維持する（バッティング・重複防止）
+        for d in dates:
+            tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
+            for t in all_tasks:
+                required_count = tasks_today.count(t)
+                model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
+
         # -------------------------------------------------------------
-        # ペア制約の適用（Initial_Scheduleに存在する実績データのみに適用）
+        # ペア制約の適用（Initial_Scheduleに存在する実績データから適用）
         # -------------------------------------------------------------
         pair_debug_logs = []
         for d_idx in range(len(dates) - 1):
@@ -129,20 +126,33 @@ if check_password():
             for p in existing_members:
                 work_curr = initial_assignment.get((p, d_curr), "")
                 
-                # 前日の仕業がペアの前半（例: 39M）に当てはまる場合のみ！
                 if work_curr in pair_rules:
                     work_next_required = pair_rules[work_curr]
-                    
                     pair_debug_logs.append(
                         f"【ペア制約適用】{p}さん: {work_curr} ({d_curr}) ➔ 翌日必ず {work_next_required} ({d_next})"
                     )
                     # 当日work_currをやった人は、翌日必ずwork_next_required
                     model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
+        # -------------------------------------------------------------
+        # 目的関数: 元のシフトを維持するインセンティブ（無用な乱打防止）
+        # -------------------------------------------------------------
+        penalty_terms = []
+        for p in existing_members:
+            for d in dates:
+                orig_t = initial_assignment.get((p, d), 'OFF')
+                if orig_t in all_tasks:
+                    # 元の仕業を維持したらボーナス（マイナスインセンティブ）
+                    penalty_terms.append(x[p, d, orig_t] * -10)
+
+        if penalty_terms:
+            model.Minimize(sum(penalty_terms))
+
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 60.0
         status = solver.Solve(model)
 
+        change_logs = []
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             result_rows = []
             for d in dates:
@@ -151,6 +161,9 @@ if check_password():
                     for t in all_tasks:
                         if solver.Value(x[p, d, t]) == 1:
                             row[p] = t
+                            orig_t = initial_assignment.get((p, d), 'OFF')
+                            if t != orig_t:
+                                change_logs.append(f"【{d}】{p}さん : {orig_t} ➔ {t}")
                             break
                 result_rows.append(row)
             
@@ -158,7 +171,7 @@ if check_password():
             df_result_horiz = df_result_vert.set_index('Date').T.reset_index()
             df_result_horiz.rename(columns={'index': header_col}, inplace=True)
             
-            return df_result_horiz, True, "OK", [], pair_debug_logs, [], []
+            return df_result_horiz, True, "OK", change_logs, pair_debug_logs, [], []
         else:
             return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], pair_debug_logs, [], []
 
@@ -174,6 +187,13 @@ if check_password():
                 
                 if success:
                     st.success("最適化計算が完了しました！")
+                    if change_logs:
+                        st.subheader("📋 変更された勤務一覧")
+                        for clog in change_logs:
+                            st.write(clog)
+                    else:
+                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした（すべてのペア制約が満たされています）。")
+
                     with st.expander("🔍 適用されたペア制約ログ"):
                         for p_log in sorted(list(set(pair_debug_logs))):
                             st.write(p_log)
