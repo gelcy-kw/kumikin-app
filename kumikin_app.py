@@ -46,10 +46,6 @@ def normalize_area(area_str):
     return a if a else 'ANY'
 
 def is_fixed_task(task_code):
-    """
-    OFF または アルファベットから始まる特殊仕業（A1-A7, J1-J6, R1-R6, S1-S3等）を
-    自動的に固定（トレード不可）判定する関数
-    """
     if not task_code or task_code == 'OFF':
         return True
     if not task_code[0].isdigit():
@@ -70,9 +66,7 @@ if check_password():
         name_col_name = df_initial_raw.columns[1]
         dates = [clean_str(c) for c in df_initial_raw.columns[2:]]
 
-        # -------------------------------------------------------------
         # 1. メンバーマスターのパース
-        # -------------------------------------------------------------
         df_members['MemberID'] = df_members['MemberID'].apply(clean_str)
         member_base_area = {}
         member_role = {}
@@ -90,9 +84,7 @@ if check_password():
 
         members = list(member_base_area.keys())
 
-        # -------------------------------------------------------------
-        # 2. 仕業マスターのパース（エリア・性別制限・ペアルール）
-        # -------------------------------------------------------------
+        # 2. 仕業マスターのパース
         task_area_map = {}
         task_female_allowed_map = {}
         pair_rules = {}
@@ -107,7 +99,6 @@ if check_password():
                 task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
 
-                # 4M / 15M などの数値＋末尾アルファベット形式の対応
                 m_match = re.match(r'^(\d+)([MC])$', t_id)
                 if m_match:
                     num_str = m_match.group(1)
@@ -119,7 +110,6 @@ if check_password():
                         prev_plain_id = f"{pair_id}{role_char}"
                         pair_rules[prev_plain_id] = t_id
 
-                # 詳細ID（MC_4_W等）形式への対応
                 m_match_long = re.match(r'([MC])_(\d+)_[WH]', t_id)
                 if not m_match_long:
                     m_match_long = re.match(r'([MC])_(\d+)', t_id)
@@ -135,7 +125,6 @@ if check_password():
                         prev_plain_id = f"{pair_id}{role_char}"
                         pair_rules[prev_plain_id] = plain_id
 
-        # 特殊仕業ペアの登録
         for _, row in df_tasks.iterrows():
             t_id = clean_str(row['TaskID'])
             pair_id = clean_str(row.get('PairTaskID', ''))
@@ -150,9 +139,7 @@ if check_password():
         def is_female_allowed(task_code):
             return task_female_allowed_map.get(task_code, 'Y') != 'N'
 
-        # -------------------------------------------------------------
         # 3. 初期勤務表データの整理
-        # -------------------------------------------------------------
         df_sched = df_initial_raw[df_initial_raw[id_col_name].apply(clean_str) != 'DAYTYPE'].copy()
         df_sched[id_col_name] = df_sched[id_col_name].apply(clean_str)
 
@@ -189,7 +176,7 @@ if check_password():
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
         # -------------------------------------------------------------
-        # ハード制約（絶対に破ってはならない条件）
+        # ハード制約
         # -------------------------------------------------------------
 
         # 1. 1人1日1仕業
@@ -197,7 +184,7 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 2. OFF・特殊仕業（A1, J5等）の固定
+        # 2. OFF・特殊仕業の固定
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
@@ -207,7 +194,7 @@ if check_password():
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, orig_t] == 1)
 
-        # 3. 役職（Role）マッチング
+        # 3. 役職マッチング
         for p in existing_members:
             p_role = member_role.get(p, '')
             for d in dates:
@@ -230,7 +217,7 @@ if check_password():
                         if not is_female_allowed(t):
                             model.Add(x[p, d, t] == 0)
 
-        # 5. 各日の仕業人数（需要）の維持
+        # 5. 各日の仕業人数の維持
         for d in dates:
             tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
             for t in all_tasks:
@@ -239,7 +226,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 6. 【絶対遵守】日跨ぎペア制約（例: 39Mをやったら翌日は絶対に40M）
+        # 6. 日跨ぎペア制約
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -249,31 +236,41 @@ if check_password():
                     for p in existing_members:
                         model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
-        # 7. 【絶対禁忌】自エリア以外の仕業の割り当て禁止
-        # メンバーの所属エリアと仕業の対象エリアが一致しない組み合わせはすべて禁止(0)
+        # 7. 【絶対禁忌ルール】他エリア仕業への新規割り当て禁止
+        # 変更先の仕業 `t` が自エリア以外（かつANY以外）である場合、その変更（orig_t != t）を禁止する
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
             if p_base_area != 'ANY':
                 for d in dates:
+                    orig_t = initial_assignment.get((p, d), 'OFF')
                     for t in all_tasks:
-                        if is_fixed_task(t):
+                        if is_fixed_task(t) or t == orig_t:
                             continue
                         t_area = get_task_area(t)
-                        # 仕業エリアが特定されており、かつメンバーの自エリアと異なる場合は割り当て不可
+                        # 変更先の仕業エリアが他エリアの場合、トレード不可
                         if t_area != 'ANY' and t_area != p_base_area:
                             model.Add(x[p, d, t] == 0)
 
         # -------------------------------------------------------------
-        # 目的関数: 変更（トレード）回数の最小化
+        # 目的関数: 自エリア一致の最大化 ＆ 変更回数の最小化
         # -------------------------------------------------------------
         objective_terms = []
 
         for p in existing_members:
+            p_base_area = member_base_area.get(p, 'ANY')
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
                 for t in all_tasks:
                     if is_fixed_task(t):
                         continue
+                    
+                    t_area = get_task_area(t)
+                    
+                    # 自エリアと一致する仕業になれば大きく加点（-10000）
+                    if p_base_area != 'ANY' and t_area == p_base_area:
+                        objective_terms.append(x[p, d, t] * -10000)
+                    
+                    # 変更（トレード）が発生したら小さなペナルティ（+1）
                     if t != orig_t:
                         objective_terms.append(x[p, d, t] * 1)
 
