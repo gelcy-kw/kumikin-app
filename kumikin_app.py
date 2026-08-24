@@ -123,4 +123,4 @@ def solve_shift_scheduling():
         print("まだ不可解（INFEASIBLE）が出るなら、ペア制約以外の基本条件（休日日数や連続勤務上限）と競合していないか確認しなさいよね。")
 
 if __name__ == '__main__':
-    solve_shift_scheduling():
+    solve_shift_scheduling()
