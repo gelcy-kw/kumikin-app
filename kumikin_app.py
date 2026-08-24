@@ -91,7 +91,7 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 2. 仕業マスターのパース（エリア & 女性不可 & ペアルール）
+        # 2. 仕業マスターのパース（エリア・性別制限・ペアルール）
         # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
@@ -107,7 +107,7 @@ if check_password():
                 task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
 
-                # 表記の正規化（例: M_1_W ➔ 1M）
+                # 4M などの省略表記マッピング
                 m_match = re.match(r'([MC])_(\d+)_[WH]', t_id)
                 if not m_match:
                     m_match = re.match(r'([MC])_(\d+)', t_id)
@@ -178,7 +178,7 @@ if check_password():
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
         # -------------------------------------------------------------
-        # ハード制約（絶対ルール）
+        # ハード制約（絶対条件）
         # -------------------------------------------------------------
 
         # 1. 1人1日1仕業
@@ -186,7 +186,7 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 2. OFF・特殊仕業（A1, J5等）の絶対固定
+        # 2. OFF・特殊仕業（A1, J5等）の固定
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
@@ -196,23 +196,7 @@ if check_password():
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, orig_t] == 1)
 
-        # 3. エリア絶対不一致ガード（自エリア外の仕業への配置は完全禁止）
-        for p in existing_members:
-            p_base_area = member_base_area.get(p, 'ANY')
-            if p_base_area == 'ANY':
-                continue
-            for d in dates:
-                orig_t = initial_assignment.get((p, d), 'OFF')
-                for t in all_tasks:
-                    if is_fixed_task(t):
-                        continue
-                    t_area = get_task_area(t)
-                    # 他エリアの仕業への割り当ては絶対不可（初期配置以外）
-                    if t_area != 'ANY' and t_area != p_base_area:
-                        if t != orig_t:
-                            model.Add(x[p, d, t] == 0)
-
-        # 4. 役職（Role）マッチング
+        # 3. 役職（Role）マッチング
         for p in existing_members:
             p_role = member_role.get(p, '')
             for d in dates:
@@ -224,7 +208,7 @@ if check_password():
                     elif p_role == 'C' and t.endswith('M'):
                         model.Add(x[p, d, t] == 0)
 
-        # 5. 女性不可仕業ガード
+        # 4. 女性不可仕業ガード
         for p in existing_members:
             p_gender = member_gender.get(p, '')
             if p_gender == 'F':
@@ -235,7 +219,7 @@ if check_password():
                         if not is_female_allowed(t):
                             model.Add(x[p, d, t] == 0)
 
-        # 6. 各日の仕業人数（需要）の維持
+        # 5. 各日の仕業人数（需要）の維持
         for d in dates:
             tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
             for t in all_tasks:
@@ -244,7 +228,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 7. ペア制約（前日仕業 -> 翌日仕業の連動）
+        # 6. ペア制約（前日仕業 -> 翌日仕業）
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -255,16 +239,31 @@ if check_password():
                         model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
         # -------------------------------------------------------------
-        # 目的関数: 変更数を最小限にしつつ適正トレード
+        # 目的関数: エリア完全適正化（超強力インセンティブ） ＋ 変更最小化
         # -------------------------------------------------------------
         objective_terms = []
+
         for p in existing_members:
+            p_base_area = member_base_area.get(p, 'ANY')
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
                 for t in all_tasks:
+                    if is_fixed_task(t):
+                        continue
+                    
+                    t_area = get_task_area(t)
+                    cost = 0
+
+                    # ① エリア不一致に対するペナルティ（1,000,000点）
+                    if p_base_area != 'ANY' and t_area != 'ANY' and t_area != p_base_area:
+                        cost += 1000000
+
+                    # ② 初期シフトからの変更に対するコスト（1点）
                     if t != orig_t:
-                        # トレード変更1回につきコスト 1
-                        objective_terms.append(x[p, d, t] * 1)
+                        cost += 1
+
+                    if cost > 0:
+                        objective_terms.append(x[p, d, t] * cost)
 
         model.Minimize(sum(objective_terms))
 
@@ -335,7 +334,7 @@ if check_password():
                         for clog in change_logs:
                             st.write(clog)
                     else:
-                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（不正な他エリアまたぎトレードは防止されました）")
+                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（全ての勤務が自エリアと一致しています）")
 
                     with st.expander("🔍 適用されたペア制約ログ"):
                         for p_log in sorted(list(set(pair_debug_logs))):
