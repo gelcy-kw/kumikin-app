@@ -52,7 +52,7 @@ if check_password():
         day_types_row = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() == 'DayType']
         if day_types_row.empty:
             st.error("エラー: Initial_Schedule.csv に 'DayType' 行が見つかりません。")
-            return df_initial_raw, False, "DayType行なし"
+            return df_initial_raw, False, "DayType行なし", []
         
         dates = [clean_str(c) for c in df_initial_raw.columns[1:]]
         day_type_map = {}
@@ -75,7 +75,7 @@ if check_password():
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
             st.error("エラー: Initial_Schedule.csv のメンバーIDが Member_Master と一致しません。")
-            return df_initial_raw, False, "メンバーID不一致"
+            return df_initial_raw, False, "メンバーID不一致", []
             
         df_initial_indexed = df_initial_indexed.loc[existing_members]
 
@@ -189,24 +189,8 @@ if check_password():
                     if (p_role == 'M' and t_role == 'C') or (p_role == 'C' and t_role == 'M'):
                         model.Add(x[p, d, t_id] == 0)
 
-        # -------------------------------------------------------------
-        # 目的関数: トレード最適化の評価
-        # -------------------------------------------------------------
-        penalty_terms = []
-
-        # 1. 拠点ミスマッチペナルティ [最優先: 1,000,000点]
-        for p in existing_members:
-            home_st = clean_str(members_info[p].get('BaseArea', ''))
-            for d in days:
-                for t_id in all_tasks:
-                    if t_id == 'OFF':
-                        continue
-                    t_info = tasks_master.get(t_id, {})
-                    target_area = clean_str(t_info.get('TargetArea', ''))
-                    if target_area and home_st and target_area != home_st:
-                        penalty_terms.append(x[p, d, t_id] * 1000000)
-
-        # 2. 連続ペアタスク違反 [優先度高: 100,000点]
+        # 【追加】ペア仕業の連続性遵守（ハード制約）
+        # 1日目にペアの前半を担当した場合、2日目は絶対にペアの後半を担当しなければならない
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -222,12 +206,27 @@ if check_password():
                     
                     if resolved_pair_id in all_tasks:
                         for p in existing_members:
-                            pair_violation = model.NewBoolVar(f'pv_{p}_{d_curr}_{t_id}')
-                            model.AddBoolAnd([x[p, d_curr, t_id], x[p, d_next, resolved_pair_id].Not()]).OnlyEnforceIf(pair_violation)
-                            model.AddBoolOr([x[p, d_curr, t_id].Not(), x[p, d_next, resolved_pair_id]]).OnlyEnforceIf(pair_violation.Not())
-                            penalty_terms.append(pair_violation * 100000)
+                            # x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id]
+                            model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
-        # 3. Late-Early (遅番→早番) 回避 [優先度中: 1,000点]
+        # -------------------------------------------------------------
+        # 目的関数: 拠点ミスマッチ排除、遅早違反の回避
+        # -------------------------------------------------------------
+        penalty_terms = []
+
+        # 1. 拠点ミスマッチペナルティ [10,000点]
+        for p in existing_members:
+            home_st = clean_str(members_info[p].get('BaseArea', ''))
+            for d in days:
+                for t_id in all_tasks:
+                    if t_id == 'OFF':
+                        continue
+                    t_info = tasks_master.get(t_id, {})
+                    target_area = clean_str(t_info.get('TargetArea', ''))
+                    if target_area and home_st and target_area != home_st:
+                        penalty_terms.append(x[p, d, t_id] * 10000)
+
+        # 2. Late-Early (遅番→早番) 回避 [100点]
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -239,15 +238,16 @@ if check_password():
                                 late_early = model.NewBoolVar(f'le_{p}_{d_curr}_{t1_id}_{t2_id}')
                                 model.AddBoolAnd([x[p, d_curr, t1_id], x[p, d_next, t2_id]]).OnlyEnforceIf(late_early)
                                 model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
-                                penalty_terms.append(late_early * 1000)
+                                penalty_terms.append(late_early * 100)
 
         if penalty_terms:
             model.Minimize(sum(penalty_terms))
         
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 30.0
+        solver.parameters.max_time_in_seconds = 60.0
         status = solver.Solve(model)
         
+        change_logs = []
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             result_rows = []
             for d in days:
@@ -255,7 +255,13 @@ if check_password():
                 for p in existing_members:
                     for t in all_tasks:
                         if (p, d, t) in x and solver.Value(x[p, d, t]) == 1:
-                            row[p] = internal_to_disp.get(t, t)
+                            assigned_disp = internal_to_disp.get(t, t)
+                            row[p] = assigned_disp
+                            
+                            # 変更があったか記録
+                            orig_raw, orig_int = initial_assignment[(p, d)]
+                            if assigned_disp != orig_raw and orig_raw != 'OFF':
+                                change_logs.append(f"【{d}】{p} : {orig_raw} ➔ {assigned_disp}")
                             break
                 result_rows.append(row)
             
@@ -279,22 +285,30 @@ if check_password():
             df_dt_row = pd.DataFrame([day_type_output_row])
             df_result_final = pd.concat([df_dt_row, df_result_horiz], ignore_index=True)
             
-            return df_result_final, True, "OK"
+            return df_result_final, True, "OK", change_logs
         else:
-            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}"
+            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", []
 
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
         if file_members and file_tasks and file_initial:
-            with st.spinner("安全なトレード条件で最適化計算中..."):
+            with st.spinner("トレード判定中..."):
                 df_m = load_csv_safely(file_members)
                 df_t = load_csv_safely(file_tasks)
                 df_i = load_csv_safely(file_initial)
                 
-                result_df, success, log_msg = run_optimization(df_m, df_t, df_i)
+                result_df, success, log_msg, change_logs = run_optimization(df_m, df_t, df_i)
                 
                 if success:
                     st.success("最適化計算が正常に完了しました！")
+                    
+                    st.subheader("📋 変更された勤務一覧")
+                    if change_logs:
+                        for log in change_logs:
+                            st.write(log)
+                    else:
+                        st.warning("⚠️ 変更された勤務はありません。ペア制約を絶対保護（ハード制約化）した結果、トレード可能なペア相手が存在しない可能性があります。")
+
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                     st.download_button(
                         label="調整済みシフト表(Optimized_Schedule.csv)をダウンロード",
