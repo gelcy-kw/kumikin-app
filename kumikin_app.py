@@ -22,6 +22,14 @@ def check_password():
         return False
     return True
 
+def load_csv_safely(uploaded_file):
+    """UTF-8 と Shift-JIS(CP932) の両対応で CSV を自動読み込み"""
+    try:
+        return pd.read_csv(uploaded_file, encoding='utf-8')
+    except (UnicodeDecodeError, pd.errors.ParserError):
+        uploaded_file.seek(0)
+        return pd.read_csv(uploaded_file, encoding='cp932')
+
 if check_password():
     # --- メイン画面UI ---
     st.title("勤務変更補助システム")
@@ -85,7 +93,6 @@ if check_password():
         disp_to_internal = {}
         internal_to_disp = {}
         for t_id, t_info in tasks_master.items():
-            # M_1_W -> M_1, A1 -> A1
             parts = t_id.split('_')
             disp_no = f"{parts[0]}_{parts[1]}" if len(parts) >= 3 else parts[0]
             d_type = str(t_info.get('DayType', 'All')).strip()
@@ -189,7 +196,6 @@ if check_password():
             for t_id, t_info in tasks_master.items():
                 pair_raw = str(t_info.get('PairTaskID', '')).strip()
                 if pair_raw and pair_raw != 'nan':
-                    # プレフィックス(M_ / C_)を保持したまま枝番を解決
                     t_role_prefix = "M_" if t_id.startswith("M_") else ("C_" if t_id.startswith("C_") else "")
                     pair_disp = f"{t_role_prefix}{pair_raw}" if t_role_prefix and not pair_raw.startswith(t_role_prefix) else pair_raw
                     
@@ -274,9 +280,10 @@ if check_password():
     if st.button("シフト最適化の実行"):
         if file_members and file_tasks and file_initial:
             with st.spinner("制約条件を計算中..."):
-                df_m = pd.read_csv(file_members)
-                df_t = pd.read_csv(file_tasks)
-                df_i = pd.read_csv(file_initial)
+                # 安全な読み込み関数を使用
+                df_m = load_csv_safely(file_members)
+                df_t = load_csv_safely(file_tasks)
+                df_i = load_csv_safely(file_initial)
                 
                 result_df, success = run_optimization(df_m, df_t, df_i)
                 
