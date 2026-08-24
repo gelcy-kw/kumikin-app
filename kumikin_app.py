@@ -7,7 +7,6 @@ from ortools.sat.python import cp_model
 st.set_page_config(page_title="勤務変更補助システム", layout="centered")
 
 def check_password():
-    """暗証番号によるアクセス制限"""
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
 
@@ -15,7 +14,7 @@ def check_password():
         st.title("🔒 アクセス制限")
         pwd = st.text_input("パスコードを入力してください", type="password")
         if st.button("ログイン"):
-            if pwd == "1026":  # パスコード
+            if pwd == "1026":
                 st.session_state["password_correct"] = True
                 st.rerun()
             else:
@@ -24,7 +23,6 @@ def check_password():
     return True
 
 def load_csv_safely(uploaded_file):
-    """UTF-8 と Shift-JIS(CP932) の両対応で CSV を自動読み込み"""
     try:
         return pd.read_csv(uploaded_file, encoding='utf-8')
     except (UnicodeDecodeError, pd.errors.ParserError):
@@ -48,7 +46,6 @@ if check_password():
     def run_optimization(df_members, df_tasks, df_initial_raw):
         header_col = df_initial_raw.columns[0]
         
-        # DayType行の取得
         day_types_row = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() == 'DayType']
         if day_types_row.empty:
             st.error("エラー: Initial_Schedule.csv に 'DayType' 行が見つかりません。")
@@ -60,12 +57,10 @@ if check_password():
             col_str = clean_str(col)
             day_type_map[col_str] = clean_str(day_types_row[col].values[0])
 
-        # Member_Master のメンバー情報＆氏名取得
         df_members['MemberID'] = df_members['MemberID'].apply(clean_str)
         members_info = df_members.set_index('MemberID').to_dict('index')
         members = list(members_info.keys())
 
-        # メンバーの行のみ抽出
         df_members_sched = df_initial_raw[df_initial_raw[header_col].apply(clean_str) != 'DayType'].copy()
         df_members_sched[header_col] = df_members_sched[header_col].apply(clean_str)
 
@@ -86,12 +81,10 @@ if check_password():
         model = cp_model.CpModel()
         days = dates
         
-        # タスクマスターの準備
         df_tasks['TaskID'] = df_tasks['TaskID'].apply(clean_str)
         tasks_master = df_tasks.set_index('TaskID').to_dict('index')
         all_tasks = list(tasks_master.keys())
 
-        # マッピング用辞書の構築
         disp_to_internal = {}
         internal_to_disp = {}
         
@@ -120,7 +113,6 @@ if check_password():
         initial_assignment = {}
         day_converted_tasks = {d: [] for d in days}
 
-        # 初期内部タスクを特定
         for d in days:
             d_type = day_type_map.get(d, 'Weekday')
             day_row = df_initial_shift[df_initial_shift['Date'] == d]
@@ -141,38 +133,34 @@ if check_password():
                 initial_assignment[(p, d)] = (raw_t, internal_t)
                 day_converted_tasks[d].append(internal_t)
 
-        # 決定変数 x[p, d, t] の定義
         x = {}
         for p in existing_members:
             for d in days:
                 for t in all_tasks:
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
-        # 制約の適用
+        # 基本制約
         for d in days:
             d_type = day_type_map.get(d, 'Weekday')
             
             for p in existing_members:
                 raw_t, internal_t = initial_assignment[(p, d)]
 
-                # 1. OFF・特殊仕業・固定日の固定
                 if raw_t == 'OFF' or internal_t == 'OFF':
                     if 'OFF' in all_tasks:
                         model.Add(x[p, d, 'OFF'] == 1)
                 elif raw_t in SPECIAL_DUTIES or internal_t in SPECIAL_DUTIES or d_type == 'Fixed':
                     model.Add(x[p, d, internal_t] == 1)
 
-            # 1人1日1タスク（絶対遵守）
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-            # 日ごとの各タスク総数を維持（全体枠の保存）
             tasks_today = day_converted_tasks[d]
             for t in set(tasks_today):
                 count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == count)
 
-        # 性別・役割不適合のトレード禁止（ハード制約）
+        # 属性不適合の完全ガード（TaskIDの末尾文字 M/C も判定）
         for p in existing_members:
             p_gender = clean_str(members_info[p].get('Gender', 'M'))
             p_role = clean_str(members_info[p].get('Role', 'MC'))
@@ -183,14 +171,20 @@ if check_password():
                     t_female_allowed = clean_str(t_info.get('FemaleAllowed', 'Y'))
                     t_role = clean_str(t_info.get('Role', 'All'))
                     
+                    # TaskIDの末尾からRoleを補正（46CならC属性）
+                    disp_t = internal_to_disp.get(t_id, t_id)
+                    if disp_t.endswith('M'):
+                        t_role = 'M'
+                    elif disp_t.endswith('C'):
+                        t_role = 'C'
+
                     if p_gender == 'F' and t_female_allowed == 'N':
                         model.Add(x[p, d, t_id] == 0)
                         
                     if (p_role == 'M' and t_role == 'C') or (p_role == 'C' and t_role == 'M'):
                         model.Add(x[p, d, t_id] == 0)
 
-        # 【追加】ペア仕業の連続性遵守（ハード制約）
-        # 1日目にペアの前半を担当した場合、2日目は絶対にペアの後半を担当しなければならない
+        # ペア仕業（一泊二日）のハード制約
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -206,11 +200,10 @@ if check_password():
                     
                     if resolved_pair_id in all_tasks:
                         for p in existing_members:
-                            # x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id]
                             model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
         # -------------------------------------------------------------
-        # 目的関数: 拠点ミスマッチ排除、遅早違反の回避
+        # 目的関数
         # -------------------------------------------------------------
         penalty_terms = []
 
@@ -226,7 +219,15 @@ if check_password():
                     if target_area and home_st and target_area != home_st:
                         penalty_terms.append(x[p, d, t_id] * 10000)
 
-        # 2. Late-Early (遅番→早番) 回避 [100点]
+        # 2. 初期シフトからの変更（トレード）コスト [10点]
+        # 解消メリット（10,000点減）がない無意味なトレードを防止する
+        for d in days:
+            for p in existing_members:
+                _, orig_int = initial_assignment[(p, d)]
+                if orig_int in all_tasks:
+                    penalty_terms.append((1 - x[p, d, orig_int]) * 10)
+
+        # 3. Late-Early (遅番→早番) 回避 [100点]
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -258,7 +259,6 @@ if check_password():
                             assigned_disp = internal_to_disp.get(t, t)
                             row[p] = assigned_disp
                             
-                            # 変更があったか記録
                             orig_raw, orig_int = initial_assignment[(p, d)]
                             if assigned_disp != orig_raw and orig_raw != 'OFF':
                                 change_logs.append(f"【{d}】{p} : {orig_raw} ➔ {assigned_disp}")
@@ -269,7 +269,6 @@ if check_password():
             df_result_horiz = df_result_vert.set_index('Date').T.reset_index()
             df_result_horiz.rename(columns={'index': header_col}, inplace=True)
             
-            # Name列の挿入
             names_list = []
             for pid in df_result_horiz[header_col]:
                 pid_str = clean_str(pid)
@@ -307,7 +306,7 @@ if check_password():
                         for log in change_logs:
                             st.write(log)
                     else:
-                        st.warning("⚠️ 変更された勤務はありません。ペア制約を絶対保護（ハード制約化）した結果、トレード可能なペア相手が存在しない可能性があります。")
+                        st.info("ℹ️ 条件を満たす効果的なトレードが存在しなかったため、無駄な変更を行わず初期シフトを維持しました。")
 
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                     st.download_button(
