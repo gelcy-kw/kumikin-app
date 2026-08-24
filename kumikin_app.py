@@ -85,7 +85,7 @@ if check_password():
         tasks_master = df_tasks.set_index('TaskID').to_dict('index')
         all_tasks = list(tasks_master.keys())
 
-        # IDの相互変換マッピング（柔軟なマッチング）
+        # IDの相互変換マッピング
         disp_to_internal = {}
         internal_to_disp = {}
         
@@ -94,7 +94,6 @@ if check_password():
             disp_to_internal[(t_id, d_type)] = t_id
             disp_to_internal[(t_id, 'All')] = t_id
             
-            # M_15 <-> 15M の相互変換対応
             m = re.match(r'^([MC])_(\d+)$', t_id)
             if m:
                 role, num = m.groups()
@@ -191,17 +190,25 @@ if check_password():
                     if (p_role == 'M' and t_role == 'C') or (p_role == 'C' and t_role == 'M'):
                         model.Add(x[p, d, t_id] == 0)
 
-        # ペア仕業（一泊二日）のハード制約＆デバッグログ作成
+        # -------------------------------------------------------------
+        # ペア仕業（一泊二日）のハード制約（★初期シフトに存在するタスクのみに限定フィルタリング）
+        # -------------------------------------------------------------
         pair_debug_logs = []
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
             next_d_type = day_type_map.get(d_next, 'Weekday')
             
-            for t_id, t_info in tasks_master.items():
+            # その日実際に存在するタスクのみを対象にする
+            active_tasks_today = set(day_converted_tasks[d_curr])
+            
+            for t_id in active_tasks_today:
+                if t_id == 'OFF':
+                    continue
+                t_info = tasks_master.get(t_id, {})
                 pair_raw = clean_str(t_info.get('PairTaskID', ''))
+                
                 if pair_raw and pair_raw not in ['nan', 'None', '']:
-                    # 表記揺れ（16M, M_16 等）を包括解決
                     resolved_pair_id = disp_to_internal.get(
                         (pair_raw, next_d_type), 
                         disp_to_internal.get((pair_raw, 'All'), 
@@ -209,7 +216,7 @@ if check_password():
                     )
                     
                     if resolved_pair_id in all_tasks:
-                        pair_debug_logs.append(f"【ペア検出】{t_id} ({d_curr}) ➔ {resolved_pair_id} ({d_next})")
+                        pair_debug_logs.append(f"【有効ペア適用】{internal_to_disp.get(t_id, t_id)} ({d_curr}) ➔ {internal_to_disp.get(resolved_pair_id, resolved_pair_id)} ({d_next})")
                         for p in existing_members:
                             model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
@@ -229,11 +236,11 @@ if check_password():
                     
                     if home_st and target_area:
                         if target_area != home_st:
-                            # 拠点ミスマッチ（大ペナルティ）
-                            penalty_terms.append(x[p, d, t_id] * 10000)
+                            # 拠点ミスマッチ（ペナルティ 1,000点）
+                            penalty_terms.append(x[p, d, t_id] * 1000)
                         else:
-                            # 拠点適合（ボーナス評価）
-                            penalty_terms.append(x[p, d, t_id] * (-1000))
+                            # 拠点適合（ボーナス -100点）
+                            penalty_terms.append(x[p, d, t_id] * (-100))
 
         # トレード抑制タイブレーク（1点）
         for d in days:
@@ -309,7 +316,7 @@ if check_password():
                     else:
                         st.info("ℹ️ 条件を満たす効果的なトレードが存在しなかったため、無駄な変更を行わず初期シフトを維持しました。")
 
-                    with st.expander("🔍 内部ペア検出ログ（デバッグ用）"):
+                    with st.expander("🔍 実際に適用されたペア制約（デバッグ用）"):
                         for p_log in list(set(pair_debug_logs)):
                             st.write(p_log)
 
