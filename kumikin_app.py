@@ -171,7 +171,6 @@ if check_password():
                     t_female_allowed = clean_str(t_info.get('FemaleAllowed', 'Y'))
                     t_role = clean_str(t_info.get('Role', 'All'))
                     
-                    # TaskIDの末尾からRoleを補正（46CならC属性）
                     disp_t = internal_to_disp.get(t_id, t_id)
                     if disp_t.endswith('M'):
                         t_role = 'M'
@@ -203,11 +202,11 @@ if check_password():
                             model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
         # -------------------------------------------------------------
-        # 目的関数
+        # 目的関数（重み付けの論理再構築）
         # -------------------------------------------------------------
         penalty_terms = []
 
-        # 1. 拠点ミスマッチペナルティ [10,000点]
+        # 1. 拠点適合度評価（ミスマッチには大ペナルティ、適合にはボーナス評価）
         for p in existing_members:
             home_st = clean_str(members_info[p].get('BaseArea', ''))
             for d in days:
@@ -216,18 +215,24 @@ if check_password():
                         continue
                     t_info = tasks_master.get(t_id, {})
                     target_area = clean_str(t_info.get('TargetArea', ''))
-                    if target_area and home_st and target_area != home_st:
-                        penalty_terms.append(x[p, d, t_id] * 10000)
+                    
+                    if home_st and target_area:
+                        if target_area != home_st:
+                            # ミスマッチ状態: 1,000点ペナルティ
+                            penalty_terms.append(x[p, d, t_id] * 1000)
+                        else:
+                            # 適合状態: 100点ボーナス（スコアを下げる）
+                            penalty_terms.append(x[p, d, t_id] * (-100))
 
-        # 2. 初期シフトからの変更（トレード）コスト [10点]
-        # 解消メリット（10,000点減）がない無意味なトレードを防止する
+        # 2. 初期シフトからのトレードタイブレーク（1点）
+        # 同一条件（スコア変化なし）での無駄なスクランブルトレードのみを抑制
         for d in days:
             for p in existing_members:
                 _, orig_int = initial_assignment[(p, d)]
                 if orig_int in all_tasks:
-                    penalty_terms.append((1 - x[p, d, orig_int]) * 10)
+                    penalty_terms.append((1 - x[p, d, orig_int]) * 1)
 
-        # 3. Late-Early (遅番→早番) 回避 [100点]
+        # 3. Late-Early (遅番→早番) 回避 [50点]
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -239,7 +244,7 @@ if check_password():
                                 late_early = model.NewBoolVar(f'le_{p}_{d_curr}_{t1_id}_{t2_id}')
                                 model.AddBoolAnd([x[p, d_curr, t1_id], x[p, d_next, t2_id]]).OnlyEnforceIf(late_early)
                                 model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
-                                penalty_terms.append(late_early * 100)
+                                penalty_terms.append(late_early * 50)
 
         if penalty_terms:
             model.Minimize(sum(penalty_terms))
