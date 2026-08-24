@@ -37,32 +37,23 @@ def clean_str(val):
     return str(val).strip()
 
 def normalize_task_id(t_str):
-    """
-    15M -> (15, 'M')
-    M_15 -> (15, 'M')
-    M_15_W -> (15, 'M')
-    """
     s = clean_str(t_str).upper()
     if not s or s == 'OFF':
         return None, None, 'OFF'
 
-    # 特殊仕業 (A1, J2, R3, S1 など)
     if re.match(r'^[AJRS]\d+$', s):
         return None, None, s
 
-    # 15M, 46C
     m1 = re.match(r'^(\d+)([MC])$', s)
     if m1:
         num, role = m1.groups()
         return num, role, f"{role}_{num}"
 
-    # M_15_W, C_46_H
     m2 = re.match(r'^([MC])_(\d+)_?([WH])?$', s)
     if m2:
         role, num, _ = m2.groups()
         return num, role, f"{role}_{num}"
 
-    # M_15
     m3 = re.match(r'^([MC])_(\d+)$', s)
     if m3:
         role, num = m3.groups()
@@ -72,7 +63,7 @@ def normalize_task_id(t_str):
 
 if check_password():
     st.title("勤務変更補助システム")
-    st.caption("自動シフトトレード・制約最適化ソルバー")
+    st.caption("自動シフトトレード・制約最適化ソルバー（診断機能付き）")
 
     st.subheader("1. データファイルのアップロード")
     file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"])
@@ -84,8 +75,7 @@ if check_password():
         
         day_types_row = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() == 'DayType']
         if day_types_row.empty:
-            st.error("エラー: Initial_Schedule.csv に 'DayType' 行が見つかりません。")
-            return df_initial_raw, False, "DayType行なし", [], [], []
+            return df_initial_raw, False, "DayType行なし", [], [], [], []
         
         dates = [clean_str(c) for c in df_initial_raw.columns[1:]]
         day_type_map = {}
@@ -105,8 +95,7 @@ if check_password():
         
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
-            st.error("エラー: Initial_Schedule.csv のメンバーIDが Member_Master と一致しません。")
-            return df_initial_raw, False, "メンバーID不一致", [], [], []
+            return df_initial_raw, False, "メンバーID不一致", [], [], [], []
             
         df_initial_indexed = df_initial_indexed.loc[existing_members]
 
@@ -114,14 +103,7 @@ if check_password():
         df_initial_shift.index = [clean_str(idx) for idx in df_initial_shift.index]
         df_initial_shift = df_initial_shift.reset_index().rename(columns={'index': 'Date'})
 
-        model = cp_model.CpModel()
-        days = dates
-
-        # -------------------------------------------------------------
-        # Task_Masterの読み込み（完全マスター辞書の作成）
-        # -------------------------------------------------------------
         tasks_master = {}
-        
         for _, row in df_tasks.iterrows():
             raw_id = clean_str(row.get('TaskID', ''))
             if not raw_id:
@@ -132,14 +114,9 @@ if check_password():
             info['DayType'] = clean_str(row.get('DayType', ''))
             info['Role'] = clean_str(row.get('Role', ''))
             info['FemaleAllowed'] = clean_str(row.get('FemaleAllowed', 'Y'))
-            
             tasks_master[raw_id] = info
 
         def resolve_task_id(raw_str, day_type):
-            """
-            15M + Weekday ➔ M_15_W
-            15M + Holiday ➔ M_15_H
-            """
             s = clean_str(raw_str)
             if not s or s == 'OFF':
                 return 'OFF'
@@ -153,13 +130,11 @@ if check_password():
 
             suffix = '_W' if day_type == 'Weekday' else '_H'
             
-            # ロールが指定されている場合（MまたはC）
             if role in ['M', 'C']:
                 target_key = f"{role}_{num}{suffix}"
                 if target_key in tasks_master:
                     return target_key
 
-            # ロールが不明な場合、M -> Cの順で試行
             for r in ['M', 'C']:
                 target_key = f"{r}_{num}{suffix}"
                 if target_key in tasks_master:
@@ -176,17 +151,13 @@ if check_password():
                 return f"{num}{role}"
             return full_task_id
 
-        # -------------------------------------------------------------
-        # 初期割り当ての解決
-        # -------------------------------------------------------------
         initial_assignment = {}
         all_tasks_set = set(['OFF'])
-
-        # Task_Master内にある全てのIDを登録対象にする
         for t_key in tasks_master.keys():
             all_tasks_set.add(t_key)
 
-        for d in days:
+        unresolved_warnings = []
+        for d in dates:
             d_type = day_type_map.get(d, 'Weekday')
             day_row = df_initial_shift[df_initial_shift['Date'] == d]
             
@@ -197,14 +168,18 @@ if check_password():
                     raw_t = 'OFF'
                 
                 resolved_t = resolve_task_id(raw_t, d_type)
+                if raw_t != 'OFF' and resolved_t not in tasks_master and not resolved_t.startswith(('A', 'J', 'R', 'S')):
+                    unresolved_warnings.append(f"⚠️ {d} の {p} の仕業 '{raw_t}' (解決名: '{resolved_t}') が Task_Master に存在しません！")
+                
                 initial_assignment[(p, d)] = (raw_t, resolved_t)
                 all_tasks_set.add(resolved_t)
 
         all_tasks = list(all_tasks_set)
 
+        model = cp_model.CpModel()
         x = {}
         for p in existing_members:
-            for d in days:
+            for d in dates:
                 for t in all_tasks:
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
@@ -215,57 +190,50 @@ if check_password():
             [f"S{i}" for i in range(1, 4)]
         )
 
-        # -------------------------------------------------------------
-        # 制約条件
-        # -------------------------------------------------------------
-        for d in days:
-            d_type = day_type_map.get(d, 'Weekday')
-            
-            # 各メンバーは1日1仕業
+        for d in dates:
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-            # OFF / 特殊仕業の固定
             for p in existing_members:
                 raw_t, resolved_t = initial_assignment[(p, d)]
-
                 if raw_t == 'OFF' or resolved_t == 'OFF':
                     model.Add(x[p, d, 'OFF'] == 1)
                 elif raw_t in SPECIAL_DUTIES or resolved_t in SPECIAL_DUTIES:
                     model.Add(x[p, d, resolved_t] == 1)
 
-            # 各仕業の必要人数維持（初期の仕業セットを維持）
             tasks_today = [initial_assignment[(p, d)][1] for p in existing_members]
             for t in set(tasks_today):
                 count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == count)
 
-        # 属性不適合のガード
+        # 属性制約（判定を柔軟に修正）
         for p in existing_members:
             p_gender = clean_str(members_info[p].get('Gender', 'M')).upper()
             p_role = clean_str(members_info[p].get('Role', 'MC')).upper()
             
-            for d in days:
+            for d in dates:
                 for t_id in all_tasks:
                     if t_id == 'OFF':
                         continue
                     t_info = tasks_master.get(t_id, {})
                     t_female_allowed = clean_str(t_info.get('FemaleAllowed', 'Y')).upper()
-                    t_role = clean_str(t_info.get('Role', 'All')).upper()
+                    t_role = clean_str(t_info.get('Role', 'ALL')).upper()
 
-                    # 女性不可仕業に女性を割り当てない
                     if p_gender == 'F' and t_female_allowed == 'N':
                         model.Add(x[p, d, t_id] == 0)
                         
-                    # 職種（M/C）の適合性チェック
-                    if (p_role == 'M' and t_role == 'C') or (p_role == 'C' and t_role == 'M'):
-                        model.Add(x[p, d, t_id] == 0)
+                    # MC表記（両対応）に対応
+                    if p_role != 'MC' and t_role not in ['ALL', '']:
+                        if p_role == 'M' and t_role == 'C':
+                            model.Add(x[p, d, t_id] == 0)
+                        elif p_role == 'C' and t_role == 'M':
+                            model.Add(x[p, d, t_id] == 0)
 
         # ペア仕業（一泊二日）のハード制約
         pair_debug_logs = []
-        for d_idx in range(len(days) - 1):
-            d_curr = days[d_idx]
-            d_next = days[d_idx + 1]
+        for d_idx in range(len(dates) - 1):
+            d_curr = dates[d_idx]
+            d_next = dates[d_idx + 1]
             next_d_type = day_type_map.get(d_next, 'Weekday')
             
             for p_today in existing_members:
@@ -277,7 +245,6 @@ if check_password():
                 pair_raw = clean_str(t_info.get('PairTaskID', ''))
                 
                 if pair_raw and pair_raw not in ['nan', 'None', '']:
-                    # PairTaskID (例: "15" や "60") を翌日の DayType に合わせて解決
                     curr_role = t_info.get('Role', 'M')
                     pair_resolved = resolve_task_id(f"{pair_raw}{curr_role}", next_d_type)
                     
@@ -288,15 +255,13 @@ if check_password():
                         for p in existing_members:
                             model.Add(x[p, d_curr, t_curr] == x[p, d_next, pair_resolved])
 
-        # -------------------------------------------------------------
-        # 目的関数（拠点不一致ペナルティ & トレードインセンティブ）
-        # -------------------------------------------------------------
+        # 目的関数
         penalty_terms = []
         score_debug_logs = []
 
         for p in existing_members:
             home_st = clean_str(members_info[p].get('BaseArea', '')).strip()
-            for d in days:
+            for d in dates:
                 raw_t, orig_resolved = initial_assignment[(p, d)]
                 if orig_resolved == 'OFF':
                     continue
@@ -305,7 +270,7 @@ if check_password():
                 target_area = clean_str(t_info.get('TargetArea', '')).strip()
                 
                 score_debug_logs.append(
-                    f"【初期状態診断】{d} メンバー:{p}(所属:{home_st}) ➔ 担当仕業:{raw_t}(識別ID:{orig_resolved}, TargetArea:'{target_area}')"
+                    f"【初期状態】{d} {p}(所属:{home_st}) ➔ {raw_t}(ID:{orig_resolved}, Area:'{target_area}')"
                 )
 
                 for t_id in all_tasks:
@@ -316,14 +281,11 @@ if check_password():
                     
                     if home_st and t_target:
                         if t_target.lower() != home_st.lower():
-                            # 他拠点の仕業には大きなペナルティ
                             penalty_terms.append(x[p, d, t_id] * 1000)
                         else:
-                            # 自拠点の仕業には報酬
                             penalty_terms.append(x[p, d, t_id] * (-100))
 
-        # トレードが発生しないことへの微小なペナルティ（同等条件なら現状維持優先）
-        for d in days:
+        for d in dates:
             for p in existing_members:
                 _, orig_resolved = initial_assignment[(p, d)]
                 if orig_resolved in all_tasks:
@@ -339,7 +301,7 @@ if check_password():
         change_logs = []
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             result_rows = []
-            for d in days:
+            for d in dates:
                 row = {'Date': d}
                 for p in existing_members:
                     for t in all_tasks:
@@ -366,15 +328,15 @@ if check_password():
             df_result_horiz.insert(1, 'Name', names_list)
 
             day_type_output_row = {header_col: 'DayType', 'Name': ''}
-            for d in days:
+            for d in dates:
                 day_type_output_row[d] = day_type_map.get(d, '')
             
             df_dt_row = pd.DataFrame([day_type_output_row])
             df_result_final = pd.concat([df_dt_row, df_result_horiz], ignore_index=True)
             
-            return df_result_final, True, "OK", change_logs, pair_debug_logs, score_debug_logs
+            return df_result_final, True, "OK", change_logs, pair_debug_logs, score_debug_logs, unresolved_warnings
         else:
-            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], pair_debug_logs, score_debug_logs
+            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], pair_debug_logs, score_debug_logs, unresolved_warnings
 
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
@@ -384,25 +346,25 @@ if check_password():
                 df_t = load_csv_safely(file_tasks)
                 df_i = load_csv_safely(file_initial)
                 
-                result_df, success, log_msg, change_logs, pair_debug_logs, score_debug_logs = run_optimization(df_m, df_t, df_i)
+                result_df, success, log_msg, change_logs, pair_debug_logs, score_debug_logs, unresolved_warnings = run_optimization(df_m, df_t, df_i)
                 
+                if unresolved_warnings:
+                    st.warning("⚠️ マッチング未解決警告が検知されました:")
+                    for w in unresolved_warnings:
+                        st.write(w)
+
                 if success:
                     st.success("最適化計算が正常に完了しました！")
-                    
                     st.subheader("📋 変更された勤務一覧")
                     if change_logs:
                         for log in change_logs:
                             st.write(log)
                     else:
-                        st.info("ℹ️ 条件を満たす効果的なトレードが存在しなかったため、無駄な変更を行わず初期シフトを維持しました。")
+                        st.info("ℹ️ 初期シフトで既に最適か、交換可能なペアが存在しませんでした。")
 
                     with st.expander("🔍 適用されたペア制約ログ"):
                         for p_log in list(set(pair_debug_logs)):
                             st.write(p_log)
-
-                    with st.expander("🔍 初期シフトの拠点マッチング診断ログ"):
-                        for s_log in score_debug_logs[:20]:
-                            st.write(s_log)
 
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                     st.download_button(
@@ -413,5 +375,11 @@ if check_password():
                     )
                 else:
                     st.error(f"解が見つかりませんでした。（詳細: {log_msg}）")
+                    with st.expander("🔍 デバッグログ（ペア制約の適用状況）"):
+                        for p_log in list(set(pair_debug_logs)):
+                            st.write(p_log)
+                    with st.expander("🔍 デバッグログ（初期勤務のマッチング状況）"):
+                        for s_log in score_debug_logs:
+                            st.write(s_log)
         else:
             st.error("エラー: 3つのファイルをすべてアップロードしてください。")
