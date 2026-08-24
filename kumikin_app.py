@@ -81,7 +81,7 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 2. 仕業マスターのパース
+        # 2. 仕業マスターのパース（TargetAreaの正確なマッピング）
         # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
@@ -92,34 +92,23 @@ if check_password():
                 t_area = clean_str(row.get('TargetArea', ''))
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
                 
-                m = re.match(r'([MC])_(\d+)', t_id)
-                if m:
-                    prefix = m.group(1)
-                    num = m.group(2)
-                    task_area_map[(num, prefix)] = t_area
-                
+                # ① TaskIDそのもの（例: 15M, 60C, A1 等）のマッピング
+                task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
                 
-                m_plain = re.match(r'([MC])_(\d+)', t_id)
-                if m_plain:
-                    p_prefix = m_plain.group(1)
-                    p_num = m_plain.group(2)
-                    task_female_allowed_map[f"{p_num}{p_prefix}"] = f_allowed
+                # ② アンダースコア形式 (M_15, C_60) ➔ プレーン形式 (15M, 60C) の変換マッピング
+                m_underscore = re.match(r'([MC])_(\d+)', t_id)
+                if m_underscore:
+                    prefix = m_underscore.group(1)
+                    num = m_underscore.group(2)
+                    plain_id = f"{num}{prefix}"
+                    task_area_map[plain_id] = t_area
+                    task_female_allowed_map[plain_id] = f_allowed
 
         def get_task_area(task_code):
             if is_fixed_task(task_code):
                 return 'ANY'
-            m = re.match(r'(\d+)([MC])', task_code)
-            if m:
-                num = m.group(1)
-                prefix = m.group(2)
-                return task_area_map.get((num, prefix), 'ANY')
-            m = re.match(r'([MC])(\d+)', task_code)
-            if m:
-                prefix = m.group(1)
-                num = m.group(2)
-                return task_area_map.get((num, prefix), 'ANY')
-            return 'ANY'
+            return task_area_map.get(task_code, 'ANY')
 
         def is_female_allowed(task_code):
             return task_female_allowed_map.get(task_code, 'Y') != 'N'
@@ -228,7 +217,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 6. ペア制約
+        # 6. ペア制約（連番仕業）
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -238,8 +227,8 @@ if check_password():
                     for p in existing_members:
                         model.Add(x[p, d_next, work_next_required] == 1).OnlyEnforceIf(x[p, d_curr, work_curr])
 
-        # ★【新規追加】7. 連続2日間の勤務場所（拠点）の一致制約
-        # 連続する2日間において、異なる他拠点へ日替わりで出勤することを禁止する
+        # 7. 連続2日間の勤務場所（TargetArea）の一致制約
+        # 連続出勤する2日間において、異なる出勤エリア（例: Akaike ➔ Joshin）への日替わり勤務を禁止
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -254,7 +243,7 @@ if check_password():
                         if area2 == 'ANY':
                             continue
                         
-                        # 2日間のエリアが異なっている場合は同時割当を禁止
+                        # TargetAreaが異なっている（Akaike ⇄ Joshin）場合は連続割当を禁止
                         if area1 != area2:
                             model.AddBoolOr([x[p, d_curr, t1].Not(), x[p, d_next, t2].Not()])
 
