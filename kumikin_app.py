@@ -42,7 +42,6 @@ def is_fixed_task(task_code):
     """
     if not task_code or task_code == 'OFF':
         return True
-    # 数字で始まらない仕業（例: A1, J5, R3, S2 など）はすべて固定扱い
     if not task_code[0].isdigit():
         return True
     return False
@@ -62,7 +61,7 @@ if check_password():
         dates = [clean_str(c) for c in df_initial_raw.columns[2:]]
 
         # -------------------------------------------------------------
-        # 1. メンバーマスターのパース (BaseArea, Role, Gender 取得)
+        # 1. メンバーマスターのパース
         # -------------------------------------------------------------
         df_members['MemberID'] = df_members['MemberID'].apply(clean_str)
         member_base_area = {}
@@ -82,7 +81,7 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 2. 仕業マスターのパース (TargetArea, FemaleAllowed 取得)
+        # 2. 仕業マスターのパース
         # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
@@ -93,18 +92,14 @@ if check_password():
                 t_area = clean_str(row.get('TargetArea', ''))
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
                 
-                # ① TaskID から (num, prefix) を解析してエリアマップ登録
                 m = re.match(r'([MC])_(\d+)', t_id)
                 if m:
                     prefix = m.group(1)
                     num = m.group(2)
                     task_area_map[(num, prefix)] = t_area
                 
-                # ② t_id そのもの（例: A1, J1, 15M, 15C等）の女性可否マップ登録
-                # アンダースコア形式(M_15)もプレーン形式(15M)も網羅するように登録
                 task_female_allowed_map[t_id] = f_allowed
                 
-                # プレーン表記（15M, 15C等）にもマッピング変換して登録
                 m_plain = re.match(r'([MC])_(\d+)', t_id)
                 if m_plain:
                     p_prefix = m_plain.group(1)
@@ -127,7 +122,6 @@ if check_password():
             return 'ANY'
 
         def is_female_allowed(task_code):
-            # デフォルトは 'Y'（不可が明示されている場合のみ 'N'）
             return task_female_allowed_map.get(task_code, 'Y') != 'N'
 
         # -------------------------------------------------------------
@@ -192,7 +186,7 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 2. OFF および 特殊仕業（アルファベット開始）の絶対固定制約
+        # 2. OFF および 特殊仕業の絶対固定制約
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
@@ -214,7 +208,7 @@ if check_password():
                     elif p_role == 'C' and t.endswith('M'):
                         model.Add(x[p, d, t] == 0)
 
-        # ★【追加】4. 女性（Gender = F）の割り当て不可（FemaleAllowed = N）ガード制約
+        # 4. 女性（Gender = F）の割り当て不可（FemaleAllowed = N）ガード制約
         for p in existing_members:
             p_gender = member_gender.get(p, '')
             if p_gender == 'F':
@@ -243,6 +237,26 @@ if check_password():
                 if work_curr in all_tasks and work_next_required in all_tasks:
                     for p in existing_members:
                         model.Add(x[p, d_next, work_next_required] == 1).OnlyEnforceIf(x[p, d_curr, work_curr])
+
+        # ★【新規追加】7. 連続2日間の勤務場所（拠点）の一致制約
+        # 連続する2日間において、異なる他拠点へ日替わりで出勤することを禁止する
+        for d_idx in range(len(dates) - 1):
+            d_curr = dates[d_idx]
+            d_next = dates[d_idx + 1]
+
+            for p in existing_members:
+                for t1 in all_tasks:
+                    area1 = get_task_area(t1)
+                    if area1 == 'ANY':
+                        continue
+                    for t2 in all_tasks:
+                        area2 = get_task_area(t2)
+                        if area2 == 'ANY':
+                            continue
+                        
+                        # 2日間のエリアが異なっている場合は同時割当を禁止
+                        if area1 != area2:
+                            model.AddBoolOr([x[p, d_curr, t1].Not(), x[p, d_next, t2].Not()])
 
         # -------------------------------------------------------------
         # 目的関数: エリア不一致コストの最小化 & 不要な変更の抑制
