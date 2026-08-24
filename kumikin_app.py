@@ -3,7 +3,6 @@ import pandas as pd
 import re
 from ortools.sat.python import cp_model
 
-# ページ基本設定
 st.set_page_config(page_title="勤務変更補助システム", layout="centered")
 
 def check_password():
@@ -46,8 +45,10 @@ if check_password():
     file_initial = st.file_uploader("初期勤務表 (Initial_Schedule.csv)", type=["csv"])
 
     def run_optimization(df_members, df_tasks, df_initial_raw):
-        header_col = df_initial_raw.columns[0]
-        dates = [clean_str(c) for c in df_initial_raw.columns[1:]]
+        # 列の解析: 1列目=MemberID, 2列目=Name, 3列目以降=日付
+        id_col_name = df_initial_raw.columns[0]
+        name_col_name = df_initial_raw.columns[1]
+        dates = [clean_str(c) for c in df_initial_raw.columns[2:]]
 
         # -------------------------------------------------------------
         # 1. メンバーマスターのパース
@@ -62,7 +63,7 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 2. 仕業マスターのパース (TargetArea 取得)
+        # 2. 仕業マスターのパース
         # -------------------------------------------------------------
         task_area_map = {}
         if 'TaskID' in df_tasks.columns and 'TargetArea' in df_tasks.columns:
@@ -94,15 +95,22 @@ if check_password():
         # -------------------------------------------------------------
         # 3. 初期勤務表データの整理
         # -------------------------------------------------------------
-        df_members_sched = df_initial_raw[df_initial_raw[header_col].apply(clean_str) != 'DAYTYPE'].copy()
-        df_members_sched[header_col] = df_members_sched[header_col].apply(clean_str)
+        # DayType行などを除外
+        df_sched = df_initial_raw[df_initial_raw[id_col_name].apply(clean_str) != 'DAYTYPE'].copy()
+        df_sched[id_col_name] = df_sched[id_col_name].apply(clean_str)
 
-        df_initial_indexed = df_members_sched.set_index(header_col)
-        df_initial_indexed.columns = [clean_str(c) for c in df_initial_indexed.columns]
+        # ID ➔ Name のマッピングを作成
+        member_names = {}
+        for _, row in df_sched.iterrows():
+            m_id = clean_str(row[id_col_name])
+            m_name = str(row[name_col_name]).strip() if pd.notna(row[name_col_name]) else m_id
+            member_names[m_id] = m_name
+
+        df_initial_indexed = df_sched.set_index(id_col_name)
         
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
-            return df_initial_raw, False, "メンバーID不一致", [], [], [], []
+            return df_initial_raw, False, "メンバーIDが一致しませんでした", [], [], [], []
 
         initial_assignment = {}
         all_tasks_set = set(['OFF'])
@@ -140,26 +148,25 @@ if check_password():
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
         # -------------------------------------------------------------
-        # 制約条件の設定
+        # 制約条件
         # -------------------------------------------------------------
 
-        # 制約1: 1人1日1仕業
+        # 1. 1人1日1仕業
         for d in dates:
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # ★【強固な修正】制約2: 初期シフトで OFF の日は絶対に OFF 以外禁止
+        # 2. 初期シフトで OFF の日は絶対に OFF
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
                 if orig_t == 'OFF':
-                    # OFF 以外の全仕業の割り振りを完全禁止 (0固定)
                     for t in all_tasks:
                         if t != 'OFF':
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, 'OFF'] == 1)
 
-        # 制約3: 各日の出勤仕業の人数（需要数）を維持
+        # 3. 各日の出勤仕業の人数（需要数）を維持
         for d in dates:
             tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
             for t in all_tasks:
@@ -168,7 +175,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 制約4: ペア制約（当日work_currを担当したら翌日はwork_next_requiredになる）
+        # 4. ペア制約
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -179,24 +186,17 @@ if check_password():
                         model.Add(x[p, d_next, work_next_required] == 1).OnlyEnforceIf(x[p, d_curr, work_curr])
 
         # -------------------------------------------------------------
-        # 4. 目的関数: エリア不一致コストの最小化
+        # 目的関数: エリア不一致コストの最小化
         # -------------------------------------------------------------
         objective_terms = []
-        
         for p in existing_members:
             p_base_area = member_base_area.get(p, '')
-            
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
-                
                 for t in all_tasks:
                     t_area = get_task_area(t)
-                    
-                    # エリア不一致ペナルティ
                     if p_base_area and t_area and t_area != 'ANY' and p_base_area != t_area:
                         objective_terms.append(x[p, d, t] * 1000)
-                    
-                    # 初期シフト維持ボーナス
                     if t == orig_t:
                         objective_terms.append(x[p, d, t] * -10)
 
@@ -210,23 +210,32 @@ if check_password():
         pair_applied_logs = []
 
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-            result_rows = []
             final_schedule = {}
-
             for d in dates:
-                row = {'Date': d}
                 for p in existing_members:
                     for t in all_tasks:
                         if solver.Value(x[p, d, t]) == 1:
-                            row[p] = t
                             final_schedule[(p, d)] = t
                             orig_t = initial_assignment.get((p, d), 'OFF')
                             if t != orig_t:
-                                change_logs.append(f"【{d}】{p}さん : {orig_t} ➔ {t}")
+                                p_name = member_names.get(p, p)
+                                change_logs.append(f"【{d}】{p_name}さん({p}) : {orig_t} ➔ {t}")
                             break
+
+            # 出力データフレームの構築（1列目: MemberID, 2列目: Name, 3列目以降: 日付）
+            result_rows = []
+            for p in existing_members:
+                row = {
+                    id_col_name: p,
+                    name_col_name: member_names.get(p, '')
+                }
+                for d in dates:
+                    row[d] = final_schedule.get((p, d), 'OFF')
                 result_rows.append(row)
 
-            # 最終結果に基づいて実際に適用されたペア制約をログ化
+            df_result = pd.DataFrame(result_rows)
+
+            # ログ用ペア制約出力
             for d_idx in range(len(dates) - 1):
                 d_curr = dates[d_idx]
                 d_next = dates[d_idx + 1]
@@ -234,15 +243,12 @@ if check_password():
                     work_curr = final_schedule.get((p, d_curr), 'OFF')
                     if work_curr in pair_rules:
                         work_next = pair_rules[work_curr]
+                        p_name = member_names.get(p, p)
                         pair_applied_logs.append(
-                            f"【ペア制約適用】{p}さん: {work_curr} ({d_curr}) ➔ 翌日必ず {work_next} ({d_next})"
+                            f"【ペア制約適用】{p_name}さん({p}): {work_curr} ({d_curr}) ➔ 翌日必ず {work_next} ({d_next})"
                         )
             
-            df_result_vert = pd.DataFrame(result_rows)
-            df_result_horiz = df_result_vert.set_index('Date').T.reset_index()
-            df_result_horiz.rename(columns={'index': header_col}, inplace=True)
-            
-            return df_result_horiz, True, "OK", change_logs, pair_applied_logs, [], []
+            return df_result, True, "OK", change_logs, pair_applied_logs, [], []
         else:
             return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], [], [], []
 
@@ -268,6 +274,10 @@ if check_password():
                     with st.expander("🔍 適用されたペア制約ログ"):
                         for p_log in sorted(list(set(pair_debug_logs))):
                             st.write(p_log)
+
+                    # 結果のプレビュー表示
+                    st.subheader("📊 最適化結果プレビュー")
+                    st.dataframe(result_df)
 
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                     st.download_button(
