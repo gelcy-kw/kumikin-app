@@ -178,7 +178,7 @@ if check_password():
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
         # -------------------------------------------------------------
-        # ハード制約（絶対条件）
+        # ハード制約（絶対不可条件）
         # -------------------------------------------------------------
 
         # 1. 1人1日1仕業
@@ -196,7 +196,21 @@ if check_password():
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, orig_t] == 1)
 
-        # 3. 役職（Role）マッチング
+        # 3. エリア不一致の絶対禁止（自エリア以外の仕業割り当ては1日たりとも不可）
+        for p in existing_members:
+            p_base_area = member_base_area.get(p, 'ANY')
+            if p_base_area == 'ANY':
+                continue
+            for d in dates:
+                for t in all_tasks:
+                    if is_fixed_task(t):
+                        continue
+                    t_area = get_task_area(t)
+                    # 仕業エリアが設定されており、メンバーの所属エリアと異なる場合は配置不可
+                    if t_area != 'ANY' and t_area != p_base_area:
+                        model.Add(x[p, d, t] == 0)
+
+        # 4. 役職（Role）一致
         for p in existing_members:
             p_role = member_role.get(p, '')
             for d in dates:
@@ -208,7 +222,7 @@ if check_password():
                     elif p_role == 'C' and t.endswith('M'):
                         model.Add(x[p, d, t] == 0)
 
-        # 4. 女性不可仕業ガード
+        # 5. 女性不可仕業のガード
         for p in existing_members:
             p_gender = member_gender.get(p, '')
             if p_gender == 'F':
@@ -219,7 +233,7 @@ if check_password():
                         if not is_female_allowed(t):
                             model.Add(x[p, d, t] == 0)
 
-        # 5. 各日の仕業人数（需要）の維持
+        # 6. 各日の仕業人数の維持
         for d in dates:
             tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
             for t in all_tasks:
@@ -228,7 +242,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 6. ペア制約（前日仕業 -> 翌日仕業）
+        # 7. ペア制約（前日仕業 -> 翌日仕業の連動）
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -239,31 +253,16 @@ if check_password():
                         model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
         # -------------------------------------------------------------
-        # 目的関数: エリア完全適正化（超強力インセンティブ） ＋ 変更最小化
+        # 目的関数: 変更回数の最小化（合法なトレードの中で最小変更を選択）
         # -------------------------------------------------------------
         objective_terms = []
-
         for p in existing_members:
-            p_base_area = member_base_area.get(p, 'ANY')
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
                 for t in all_tasks:
-                    if is_fixed_task(t):
-                        continue
-                    
-                    t_area = get_task_area(t)
-                    cost = 0
-
-                    # ① エリア不一致に対するペナルティ（1,000,000点）
-                    if p_base_area != 'ANY' and t_area != 'ANY' and t_area != p_base_area:
-                        cost += 1000000
-
-                    # ② 初期シフトからの変更に対するコスト（1点）
                     if t != orig_t:
-                        cost += 1
-
-                    if cost > 0:
-                        objective_terms.append(x[p, d, t] * cost)
+                        # 初期シフトからの変更1回につきコスト 1
+                        objective_terms.append(x[p, d, t] * 1)
 
         model.Minimize(sum(objective_terms))
 
@@ -334,7 +333,7 @@ if check_password():
                         for clog in change_logs:
                             st.write(clog)
                     else:
-                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（全ての勤務が自エリアと一致しています）")
+                        st.info("ℹ️ 他エリアへの配属を防止した結果、トレード可能な対象が存在しませんでした。")
 
                     with st.expander("🔍 適用されたペア制約ログ"):
                         for p_log in sorted(list(set(pair_debug_logs))):
