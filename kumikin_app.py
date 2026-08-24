@@ -91,7 +91,7 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 2. 仕業マスターのパース（全表記パターンの網羅）
+        # 2. 仕業マスターのパース（全表記パターンの網羅 & ペアマッピング）
         # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
@@ -104,11 +104,10 @@ if check_password():
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
                 pair_id = clean_str(row.get('PairTaskID', ''))
 
-                # 原本のTaskID（例: M_1_W, A1, J1 など）を登録
                 task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
 
-                # M_1_W や C_1_W から "1M" や "1C" 形式への分解登録
+                # M_1_W などのIDから "1M" 表記の抽出
                 m_match = re.match(r'([MC])_(\d+)_[WH]', t_id)
                 if not m_match:
                     m_match = re.match(r'([MC])_(\d+)', t_id)
@@ -116,17 +115,17 @@ if check_password():
                 if m_match:
                     role_char = m_match.group(1)
                     num_str = m_match.group(2)
-                    plain_id = f"{num_str}{role_char}"  # 例: 1M, 1C
+                    plain_id = f"{num_str}{role_char}"
                     
                     task_area_map[plain_id] = t_area
                     task_female_allowed_map[plain_id] = f_allowed
 
-                    # ペア仕業の解析 (例: PairTaskIDが "4" で自身が M_5_W なら 4M -> 5M)
+                    # ペア（前日仕業 -> 翌日仕業）の構築 (例: PairTaskID=4, 自身が5M -> 4Mの翌日は5M)
                     if pair_id and pair_id.isdigit():
                         prev_plain_id = f"{pair_id}{role_char}"
                         pair_rules[prev_plain_id] = plain_id
 
-        # 特殊仕業・固定仕業の自動ペア登録 (A4->A5, A6->A7, J3->J4, J5->J6, R3->R4, R5->R6, S2->S3)
+        # 特殊仕業・固定仕業のペア登録 (A4->A5, A6->A7, J3->J4, J5->J6, R3->R4, R5->R6, S2->S3)
         for _, row in df_tasks.iterrows():
             t_id = clean_str(row['TaskID'])
             pair_id = clean_str(row.get('PairTaskID', ''))
@@ -198,7 +197,7 @@ if check_password():
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, orig_t] == 1)
 
-        # 3. 所属エリア一致制約（厳格ガード）
+        # 3. 所属エリア一致制約（絶対ガード）
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
             if p_base_area == 'ANY':
@@ -209,7 +208,6 @@ if check_password():
                     if is_fixed_task(t):
                         continue
                     t_area = get_task_area(t)
-                    # メンバー所属エリアと仕業エリアが異なり、かつ初期シフトでも無かった場合は禁止
                     if t_area != 'ANY' and t_area != p_base_area:
                         if t != orig_t:
                             model.Add(x[p, d, t] == 0)
@@ -246,7 +244,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 7. ペア制約（連番仕業）：双方向一致
+        # 7. ペア制約（連番仕業）：前日仕業が入っている場合、翌日は必ず指定ペア仕業
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -257,7 +255,7 @@ if check_password():
                         model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
         # -------------------------------------------------------------
-        # 目的関数: 不要なシフト変更の抑制
+        # 目的関数: 変更数を最小限にしつつ適正なトレードを実行
         # -------------------------------------------------------------
         objective_terms = []
         for p in existing_members:
@@ -265,6 +263,7 @@ if check_password():
                 orig_t = initial_assignment.get((p, d), 'OFF')
                 for t in all_tasks:
                     if t != orig_t:
+                        # 変更1回につきコスト 1（必要最小限の変更で最適トレードを行う）
                         objective_terms.append(x[p, d, t] * 1)
 
         model.Minimize(sum(objective_terms))
@@ -336,7 +335,7 @@ if check_password():
                         for clog in change_logs:
                             st.write(clog)
                     else:
-                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（制約を完全に満たしています）")
+                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（初期シフトの段階ですべての制約を満たしています）")
 
                     with st.expander("🔍 適用されたペア制約ログ"):
                         for p_log in sorted(list(set(pair_debug_logs))):
