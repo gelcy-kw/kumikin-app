@@ -81,16 +81,33 @@ if check_password():
         model = cp_model.CpModel()
         days = dates
         
+        # -------------------------------------------------------------
+        # Task_Masterの読み込みとエイリアス登録（完全相互参照化）
+        # -------------------------------------------------------------
         df_tasks['TaskID'] = df_tasks['TaskID'].apply(clean_str)
-        tasks_master = df_tasks.set_index('TaskID').to_dict('index')
-        all_tasks = list(tasks_master.keys())
+        
+        # TargetArea列名の揺れ対策
+        target_col = 'TargetArea'
+        if 'TargetArea' not in df_tasks.columns:
+            for col in df_tasks.columns:
+                if 'target' in col.lower() or '拠点' in col or 'area' in col.lower():
+                    target_col = col
+                    break
 
-        # ID相互変換テーブルと情報検索関数の定義
+        tasks_master = {}
         disp_to_internal = {}
         internal_to_disp = {}
-        
-        for t_id, t_info in tasks_master.items():
-            d_type = clean_str(t_info.get('DayType', 'All'))
+
+        for _, row in df_tasks.iterrows():
+            t_id = clean_str(row['TaskID'])
+            info = row.to_dict()
+            info['TargetArea'] = clean_str(row.get(target_col, ''))
+            
+            # 元IDで登録
+            tasks_master[t_id] = info
+            
+            # M_15 <-> 15M 相互変換エイリアスの生成
+            d_type = clean_str(info.get('DayType', 'All'))
             disp_to_internal[(t_id, d_type)] = t_id
             disp_to_internal[(t_id, 'All')] = t_id
             
@@ -98,6 +115,7 @@ if check_password():
             if m:
                 role, num = m.groups()
                 alt_id = f"{num}{role}"
+                tasks_master[alt_id] = info  # エイリアスでも直接参照可能にする
                 disp_to_internal[(alt_id, d_type)] = t_id
                 disp_to_internal[(alt_id, 'All')] = t_id
                 internal_to_disp[t_id] = alt_id
@@ -106,28 +124,15 @@ if check_password():
                 if m2:
                     num, role = m2.groups()
                     alt_id = f"{role}_{num}"
+                    tasks_master[alt_id] = info  # エイリアスでも直接参照可能にする
                     disp_to_internal[(alt_id, d_type)] = t_id
                     disp_to_internal[(alt_id, 'All')] = t_id
                 internal_to_disp[t_id] = t_id
 
+        all_tasks = list(tasks_master.keys())
+
         def get_task_info(t_id):
-            """内部ID・表示ID・エイリアスを考慮してTaskMasterから情報を確実に取得"""
-            if t_id in tasks_master:
-                return tasks_master[t_id]
-            # M_15 <-> 15M 相互変換による探索
-            m = re.match(r'^(\d+)([MC])$', t_id)
-            if m:
-                num, role = m.groups()
-                alt_id = f"{role}_{num}"
-                if alt_id in tasks_master:
-                    return tasks_master[alt_id]
-            m2 = re.match(r'^([MC])_(\d+)$', t_id)
-            if m2:
-                role, num = m2.groups()
-                alt_id = f"{num}{role}"
-                if alt_id in tasks_master:
-                    return tasks_master[alt_id]
-            return {}
+            return tasks_master.get(t_id, {})
 
         SPECIAL_DUTIES = (
             [f"A{i}" for i in range(1, 8)] +
@@ -151,10 +156,11 @@ if check_password():
                 
                 internal_t = disp_to_internal.get((raw_t, d_type), disp_to_internal.get((raw_t, 'All'), raw_t))
                 
-                if internal_t not in all_tasks:
-                    all_tasks.append(internal_t)
+                if internal_t not in tasks_master:
                     tasks_master[internal_t] = {'TargetArea': '', 'FemaleAllowed': 'Y', 'Role': 'All', 'Load': 0}
                     internal_to_disp[internal_t] = raw_t
+                if internal_t not in all_tasks:
+                    all_tasks.append(internal_t)
 
                 initial_assignment[(p, d)] = (raw_t, internal_t)
                 day_converted_tasks[d].append(internal_t)
@@ -237,7 +243,7 @@ if check_password():
                             model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
         # -------------------------------------------------------------
-        # 目的関数 ＆ デバッグデータ収集（TargetArea修正対応）
+        # 目的関数 ＆ デバッグデータ収集
         # -------------------------------------------------------------
         penalty_terms = []
         score_debug_logs = []
