@@ -92,11 +92,9 @@ if check_password():
                 t_area = clean_str(row.get('TargetArea', ''))
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
                 
-                # ① TaskIDそのもの（例: 15M, 60C, A1 等）のマッピング
                 task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
                 
-                # ② アンダースコア形式 (M_15, C_60) ➔ プレーン形式 (15M, 60C) の変換マッピング
                 m_underscore = re.match(r'([MC])_(\d+)', t_id)
                 if m_underscore:
                     prefix = m_underscore.group(1)
@@ -129,7 +127,7 @@ if check_password():
         
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
-            return df_initial_raw, False, "メンバーIDが一致しませんでした", [], [], [], []
+            return df_initial_raw, False, "メンバーIDが一致しませんでした", [], [], [], [], {}
 
         initial_assignment = {}
         all_tasks_set = set(['OFF'])
@@ -248,7 +246,6 @@ if check_password():
                         objective_terms.append(x[p, d, t] * 1)
 
         # ③ 連続2日間のエリア跨ぎ（日替わり出勤）に対する強いペナルティ (+2000)
-        # これにより、ハード制約でエラーを出さずに「出勤地が日替わりになる不適切なトレード」を回避する
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -263,7 +260,6 @@ if check_password():
                         if area2 == 'ANY':
                             continue
                         
-                        # TargetAreaが異なる（Akaike ⇄ Joshin）ペアが発生する場合に大きなペナルティを付与
                         if area1 != area2:
                             both_selected = model.NewBoolVar(f'area_mismatch_{p}_{d_curr}_{t1}_{t2}')
                             model.AddBoolAnd([x[p, d_curr, t1], x[p, d_next, t2]]).OnlyEnforceIf(both_selected)
@@ -278,6 +274,7 @@ if check_password():
 
         change_logs = []
         pair_applied_logs = []
+        changed_cells = set() # (MemberID, Date) のセット
 
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             final_schedule = {}
@@ -290,6 +287,7 @@ if check_password():
                             if t != orig_t:
                                 p_name = member_names.get(p, p)
                                 change_logs.append(f"【{d}】{p_name}さん({p}) : {orig_t} ➔ {t}")
+                                changed_cells.add((p, d)) # 変更箇所を記録
                             break
 
             result_rows = []
@@ -316,9 +314,9 @@ if check_password():
                             f"【ペア制約適用】{p_name}さん({p}): {work_curr} ({d_curr}) ➔ 翌日必ず {work_next} ({d_next})"
                         )
             
-            return df_result, True, "OK", change_logs, pair_applied_logs, [], []
+            return df_result, True, "OK", change_logs, pair_applied_logs, [], [], changed_cells, id_col_name
         else:
-            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], [], [], []
+            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], [], [], [], set(), ""
 
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
@@ -328,7 +326,7 @@ if check_password():
                 df_t = load_csv_safely(file_tasks)
                 df_i = load_csv_safely(file_initial)
                 
-                result_df, success, log_msg, change_logs, pair_debug_logs, _, _ = run_optimization(df_m, df_t, df_i)
+                result_df, success, log_msg, change_logs, pair_debug_logs, _, _, changed_cells, id_col = run_optimization(df_m, df_t, df_i)
                 
                 if success:
                     st.success("最適化計算が完了しました！")
@@ -344,7 +342,22 @@ if check_password():
                             st.write(p_log)
 
                     st.subheader("📊 最適化結果プレビュー")
-                    st.dataframe(result_df)
+                    st.caption("※ 初期シフトから変更された箇所は **黄緑色** にハイライトされます")
+
+                    # セルハイライト関数の定義
+                    def highlight_changes(df):
+                        # 空のスタイルDataFrameを作成
+                        style_df = pd.DataFrame('', index=df.index, columns=df.columns)
+                        for idx, row in df.iterrows():
+                            p_id = str(row[id_col])
+                            for col in df.columns:
+                                if (p_id, str(col)) in changed_cells:
+                                    # 変更箇所を明るい黄緑色（#d4edda）と太字で目立たせる
+                                    style_df.loc[idx, col] = 'background-color: #d4edda; color: #155724; font-weight: bold;'
+                        return style_df
+
+                    styled_df = result_df.style.apply(highlight_changes, axis=None)
+                    st.dataframe(styled_df)
 
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                     st.download_button(
