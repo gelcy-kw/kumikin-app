@@ -62,35 +62,54 @@ if check_password():
         dates = [clean_str(c) for c in df_initial_raw.columns[2:]]
 
         # -------------------------------------------------------------
-        # 1. メンバーマスターのパース
+        # 1. メンバーマスターのパース (BaseArea, Role, Gender 取得)
         # -------------------------------------------------------------
         df_members['MemberID'] = df_members['MemberID'].apply(clean_str)
         member_base_area = {}
         member_role = {}
+        member_gender = {}
         
         for _, row in df_members.iterrows():
             m_id = clean_str(row['MemberID'])
             area = clean_str(row.get('BaseArea', ''))
             role = clean_str(row.get('Role', ''))
+            gender = clean_str(row.get('Gender', ''))
+            
             member_base_area[m_id] = area
             member_role[m_id] = role
+            member_gender[m_id] = gender
 
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 2. 仕業マスターのパース
+        # 2. 仕業マスターのパース (TargetArea, FemaleAllowed 取得)
         # -------------------------------------------------------------
         task_area_map = {}
-        if 'TaskID' in df_tasks.columns and 'TargetArea' in df_tasks.columns:
+        task_female_allowed_map = {}
+
+        if 'TaskID' in df_tasks.columns:
             for _, row in df_tasks.iterrows():
                 t_id = clean_str(row['TaskID'])
-                t_area = clean_str(row['TargetArea'])
+                t_area = clean_str(row.get('TargetArea', ''))
+                f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
                 
+                # ① TaskID から (num, prefix) を解析してエリアマップ登録
                 m = re.match(r'([MC])_(\d+)', t_id)
                 if m:
                     prefix = m.group(1)
                     num = m.group(2)
                     task_area_map[(num, prefix)] = t_area
+                
+                # ② t_id そのもの（例: A1, J1, 15M, 15C等）の女性可否マップ登録
+                # アンダースコア形式(M_15)もプレーン形式(15M)も網羅するように登録
+                task_female_allowed_map[t_id] = f_allowed
+                
+                # プレーン表記（15M, 15C等）にもマッピング変換して登録
+                m_plain = re.match(r'([MC])_(\d+)', t_id)
+                if m_plain:
+                    p_prefix = m_plain.group(1)
+                    p_num = m_plain.group(2)
+                    task_female_allowed_map[f"{p_num}{p_prefix}"] = f_allowed
 
         def get_task_area(task_code):
             if is_fixed_task(task_code):
@@ -106,6 +125,10 @@ if check_password():
                 num = m.group(2)
                 return task_area_map.get((num, prefix), 'ANY')
             return 'ANY'
+
+        def is_female_allowed(task_code):
+            # デフォルトは 'Y'（不可が明示されている場合のみ 'N'）
+            return task_female_allowed_map.get(task_code, 'Y') != 'N'
 
         # -------------------------------------------------------------
         # 3. 初期勤務表データの整理
@@ -169,7 +192,7 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # ★ 2. OFF および 特殊仕業（アルファベット開始）の絶対固定制約
+        # 2. OFF および 特殊仕業（アルファベット開始）の絶対固定制約
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
@@ -191,7 +214,18 @@ if check_password():
                     elif p_role == 'C' and t.endswith('M'):
                         model.Add(x[p, d, t] == 0)
 
-        # 4. 各日の出勤仕業の人数（需要数）を維持
+        # ★【追加】4. 女性（Gender = F）の割り当て不可（FemaleAllowed = N）ガード制約
+        for p in existing_members:
+            p_gender = member_gender.get(p, '')
+            if p_gender == 'F':
+                for d in dates:
+                    for t in all_tasks:
+                        if is_fixed_task(t):
+                            continue
+                        if not is_female_allowed(t):
+                            model.Add(x[p, d, t] == 0)
+
+        # 5. 各日の出勤仕業の人数（需要数）を維持
         for d in dates:
             tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
             for t in all_tasks:
@@ -200,7 +234,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 5. ペア制約
+        # 6. ペア制約
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
