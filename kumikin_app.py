@@ -55,7 +55,7 @@ if check_password():
             col_str = str(col).strip()
             day_type_map[col_str] = str(day_types_row[col].values[0]).strip()
 
-        # Member_Master のメンバー情報取得
+        # Member_Master のメンバー情報＆氏名取得
         df_members['MemberID'] = df_members['MemberID'].astype(str).str.strip()
         members_info = df_members.set_index('MemberID').to_dict('index')
         members = list(members_info.keys())
@@ -152,12 +152,11 @@ if check_password():
         # -------------------------------------------------------------
         penalty_terms = []
 
-        # 初期配置維持のインセンティブ（ソフト制約化）
+        # 初期配置維持のインセンティブ
         for p in existing_members:
             for d in days:
                 raw_t, init_t = initial_assignment[(p, d)]
                 if (p, d, init_t) in x:
-                    # 初期配置と異なる割り当てになった場合に小さめのペナルティ
                     is_changed = model.NewBoolVar(f'chg_{p}_{d}')
                     model.Add(x[p, d, init_t] == 0).OnlyEnforceIf(is_changed)
                     model.Add(x[p, d, init_t] == 1).OnlyEnforceIf(is_changed.Not())
@@ -175,7 +174,6 @@ if check_password():
                         continue
                     t_info = tasks_master.get(t_id, {})
                     
-                    # 性別/資格不適合の変更には絶大なペナルティ（事実上の禁止）
                     if (p_gender == 'F' and str(t_info.get('FemaleAllowed', 'Y')).strip() == 'N') or \
                        (p_role == 'M' and str(t_info.get('Role', 'All')).strip() == 'C') or \
                        (p_role == 'C' and str(t_info.get('Role', 'All')).strip() == 'M'):
@@ -200,11 +198,26 @@ if check_password():
                             break
                 result_rows.append(row)
             
+            # 縦持ちから横持ち（元の形式）へ整形
             df_result_vert = pd.DataFrame(result_rows)
             df_result_horiz = df_result_vert.set_index('Date').T.reset_index()
             df_result_horiz.rename(columns={'index': header_col}, inplace=True)
             
-            day_type_output_row = {header_col: 'DayType'}
+            # ---------------------------------------------------------
+            # Name列の挿入処理
+            # ---------------------------------------------------------
+            # 各メンバーのNameを取得して新しい列として作成
+            names_list = []
+            for pid in df_result_horiz[header_col]:
+                pid_str = str(pid).strip()
+                name_val = str(members_info.get(pid_str, {}).get('Name', '')).strip()
+                names_list.append(name_val)
+            
+            # MemberIDのすぐ右（2列目）に Name 列を挿入
+            df_result_horiz.insert(1, 'Name', names_list)
+
+            # DayType 行の作成（Name 列は空欄にする）
+            day_type_output_row = {header_col: 'DayType', 'Name': ''}
             for d in days:
                 day_type_output_row[d] = day_type_map.get(d, '')
             
