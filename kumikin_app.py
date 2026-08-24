@@ -107,7 +107,10 @@ if check_password():
                 task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
 
-                # 4M などの省略表記マッピング
+                # 4M などの表記と PairTaskID の紐付け
+                if pair_id:
+                    pair_rules[t_id] = pair_id
+
                 m_match = re.match(r'([MC])_(\d+)_[WH]', t_id)
                 if not m_match:
                     m_match = re.match(r'([MC])_(\d+)', t_id)
@@ -122,14 +125,7 @@ if check_password():
 
                     if pair_id and pair_id.isdigit():
                         prev_plain_id = f"{pair_id}{role_char}"
-                        pair_rules[prev_plain_id] = plain_id
-
-        # 特殊仕業ペアの登録
-        for _, row in df_tasks.iterrows():
-            t_id = clean_str(row['TaskID'])
-            pair_id = clean_str(row.get('PairTaskID', ''))
-            if pair_id and not pair_id.isdigit():
-                pair_rules[pair_id] = t_id
+                        pair_rules[plain_id] = prev_plain_id
 
         def get_task_area(task_code):
             if is_fixed_task(task_code):
@@ -178,7 +174,7 @@ if check_password():
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
         # -------------------------------------------------------------
-        # ハード制約（絶対不可条件）
+        # ハード制約（絶対条件）
         # -------------------------------------------------------------
 
         # 1. 1人1日1仕業
@@ -196,21 +192,7 @@ if check_password():
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, orig_t] == 1)
 
-        # 3. エリア不一致の絶対禁止（自エリア以外の仕業割り当ては1日たりとも不可）
-        for p in existing_members:
-            p_base_area = member_base_area.get(p, 'ANY')
-            if p_base_area == 'ANY':
-                continue
-            for d in dates:
-                for t in all_tasks:
-                    if is_fixed_task(t):
-                        continue
-                    t_area = get_task_area(t)
-                    # 仕業エリアが設定されており、メンバーの所属エリアと異なる場合は配置不可
-                    if t_area != 'ANY' and t_area != p_base_area:
-                        model.Add(x[p, d, t] == 0)
-
-        # 4. 役職（Role）一致
+        # 3. 役職（Role）マッチング
         for p in existing_members:
             p_role = member_role.get(p, '')
             for d in dates:
@@ -222,7 +204,7 @@ if check_password():
                     elif p_role == 'C' and t.endswith('M'):
                         model.Add(x[p, d, t] == 0)
 
-        # 5. 女性不可仕業のガード
+        # 4. 女性不可仕業ガード
         for p in existing_members:
             p_gender = member_gender.get(p, '')
             if p_gender == 'F':
@@ -233,7 +215,7 @@ if check_password():
                         if not is_female_allowed(t):
                             model.Add(x[p, d, t] == 0)
 
-        # 6. 各日の仕業人数の維持
+        # 5. 各日の仕業人数（需要）の維持
         for d in dates:
             tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
             for t in all_tasks:
@@ -242,7 +224,35 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 7. ペア制約（前日仕業 -> 翌日仕業の連動）
+        # -------------------------------------------------------------
+        # 目的関数: エリア完全適正化 ＋ ペア順序整合 ＋ 変更最小化
+        # -------------------------------------------------------------
+        objective_terms = []
+
+        # ① エリア不一致 ＆ トレード変更コスト
+        for p in existing_members:
+            p_base_area = member_base_area.get(p, 'ANY')
+            for d in dates:
+                orig_t = initial_assignment.get((p, d), 'OFF')
+                for t in all_tasks:
+                    if is_fixed_task(t):
+                        continue
+                    
+                    t_area = get_task_area(t)
+                    cost = 0
+
+                    # エリア不一致に対するペナルティ（最優先）
+                    if p_base_area != 'ANY' and t_area != 'ANY' and t_area != p_base_area:
+                        cost += 1000000
+
+                    # 初期シフトからの変更コスト
+                    if t != orig_t:
+                        cost += 1
+
+                    if cost > 0:
+                        objective_terms.append(x[p, d, t] * cost)
+
+        # ② 日跨ぎペア不整合に対するペナルティ設定
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -250,19 +260,13 @@ if check_password():
             for work_curr, work_next_required in pair_rules.items():
                 if work_curr in all_tasks and work_next_required in all_tasks:
                     for p in existing_members:
-                        model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
-
-        # -------------------------------------------------------------
-        # 目的関数: 変更回数の最小化（合法なトレードの中で最小変更を選択）
-        # -------------------------------------------------------------
-        objective_terms = []
-        for p in existing_members:
-            for d in dates:
-                orig_t = initial_assignment.get((p, d), 'OFF')
-                for t in all_tasks:
-                    if t != orig_t:
-                        # 初期シフトからの変更1回につきコスト 1
-                        objective_terms.append(x[p, d, t] * 1)
+                        # 当日 work_curr かつ 翌日 work_next_required でない場合にペナルティ発生
+                        pair_violated = model.NewBoolVar(f'pair_violated_{p}_{d_curr}')
+                        model.Add(x[p, d_curr, work_curr] == 1).OnlyEnforceIf(pair_violated)
+                        model.Add(x[p, d_next, work_next_required] == 0).OnlyEnforceIf(pair_violated)
+                        
+                        # ペア不整合ペナルティ（エリア最適化の次に重視）
+                        objective_terms.append(pair_violated * 10000)
 
         model.Minimize(sum(objective_terms))
 
@@ -309,7 +313,7 @@ if check_password():
                         work_next = pair_rules[work_curr]
                         p_name = member_names.get(p, p)
                         pair_applied_logs.append(
-                            f"【ペア制約適用】{p_name}さん({p}): {work_curr} ({d_curr}) ➔ 翌日必ず {work_next} ({d_next})"
+                            f"【ペア制約確認】{p_name}さん({p}): {work_curr} ({d_curr}) ➔ 翌日: {final_schedule.get((p, d_next), 'OFF')} ({d_next})"
                         )
             
             return df_result, True, "OK", change_logs, pair_applied_logs, [], [], changed_cells, id_col_name
@@ -333,7 +337,7 @@ if check_password():
                         for clog in change_logs:
                             st.write(clog)
                     else:
-                        st.info("ℹ️ 他エリアへの配属を防止した結果、トレード可能な対象が存在しませんでした。")
+                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（全ての勤務が自エリアと一致しています）")
 
                     with st.expander("🔍 適用されたペア制約ログ"):
                         for p_log in sorted(list(set(pair_debug_logs))):
