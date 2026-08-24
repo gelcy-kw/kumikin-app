@@ -34,6 +34,40 @@ def clean_str(val):
         return ""
     return str(val).strip()
 
+def normalize_task_id(t_str):
+    """
+    15M, M_15, M-15, 15_M などの表記揺れをすべて 'M_15' の標準形式に変換する関数
+    """
+    s = clean_str(t_str).upper()
+    if not s or s == 'OFF':
+        return 'OFF'
+    
+    # 数字+文字 (例: 15M, 46C) -> M_15, C_46
+    m1 = re.match(r'^(\d+)([MC])$', s)
+    if m1:
+        num, role = m1.groups()
+        return f"{role}_{num}"
+    
+    # 文字+数字 (例: M15, C46) -> M_15, C_46
+    m2 = re.match(r'^([MC])(\d+)$', s)
+    if m2:
+        role, num = m2.groups()
+        return f"{role}_{num}"
+
+    # 文字+記号+数字 (例: M_15, M-15) -> M_15
+    m3 = re.match(r'^([MC])[\-_](\d+)$', s)
+    if m3:
+        role, num = m3.groups()
+        return f"{role}_{num}"
+
+    # 数字+記号+文字 (例: 15_M, 15-M) -> M_15
+    m4 = re.match(r'^(\d+)[\-_]([MC])$', s)
+    if m4:
+        num, role = m4.groups()
+        return f"{role}_{num}"
+
+    return s
+
 if check_password():
     st.title("勤務変更補助システム")
     st.caption("自動シフトトレード・制約最適化ソルバー")
@@ -82,10 +116,8 @@ if check_password():
         days = dates
         
         # -------------------------------------------------------------
-        # Task_Masterの読み込みとエイリアス登録（完全相互参照化）
+        # Task_Masterの読み込みとID正規化辞書の構築
         # -------------------------------------------------------------
-        df_tasks['TaskID'] = df_tasks['TaskID'].apply(clean_str)
-        
         # TargetArea列名の揺れ対策
         target_col = 'TargetArea'
         if 'TargetArea' not in df_tasks.columns:
@@ -95,44 +127,36 @@ if check_password():
                     break
 
         tasks_master = {}
-        disp_to_internal = {}
-        internal_to_disp = {}
+        raw_to_norm = {}  # 元の表記から正規化IDへのマップ
 
         for _, row in df_tasks.iterrows():
-            t_id = clean_str(row['TaskID'])
+            raw_id = clean_str(row['TaskID'])
+            norm_id = normalize_task_id(raw_id)
+            
             info = row.to_dict()
             info['TargetArea'] = clean_str(row.get(target_col, ''))
             
-            # 元IDで登録
-            tasks_master[t_id] = info
-            
-            # M_15 <-> 15M 相互変換エイリアスの生成
-            d_type = clean_str(info.get('DayType', 'All'))
-            disp_to_internal[(t_id, d_type)] = t_id
-            disp_to_internal[(t_id, 'All')] = t_id
-            
-            m = re.match(r'^([MC])_(\d+)$', t_id)
-            if m:
-                role, num = m.groups()
-                alt_id = f"{num}{role}"
-                tasks_master[alt_id] = info  # エイリアスでも直接参照可能にする
-                disp_to_internal[(alt_id, d_type)] = t_id
-                disp_to_internal[(alt_id, 'All')] = t_id
-                internal_to_disp[t_id] = alt_id
-            else:
-                m2 = re.match(r'^(\d+)([MC])$', t_id)
-                if m2:
-                    num, role = m2.groups()
-                    alt_id = f"{role}_{num}"
-                    tasks_master[alt_id] = info  # エイリアスでも直接参照可能にする
-                    disp_to_internal[(alt_id, d_type)] = t_id
-                    disp_to_internal[(alt_id, 'All')] = t_id
-                internal_to_disp[t_id] = t_id
+            # 正規化IDを主キーとして登録
+            tasks_master[norm_id] = info
+            raw_to_norm[raw_id] = norm_id
 
         all_tasks = list(tasks_master.keys())
 
         def get_task_info(t_id):
-            return tasks_master.get(t_id, {})
+            norm = normalize_task_id(t_id)
+            return tasks_master.get(norm, {})
+
+        def get_disp_name(norm_t_id, original_raw=""):
+            """表示用ID（例: 15M）に復元する関数"""
+            if original_raw:
+                return original_raw
+            if norm_t_id == 'OFF':
+                return 'OFF'
+            m = re.match(r'^([MC])_(\d+)$', norm_t_id)
+            if m:
+                role, num = m.groups()
+                return f"{num}{role}"
+            return norm_t_id
 
         SPECIAL_DUTIES = (
             [f"A{i}" for i in range(1, 8)] +
@@ -145,7 +169,6 @@ if check_password():
         day_converted_tasks = {d: [] for d in days}
 
         for d in days:
-            d_type = day_type_map.get(d, 'Weekday')
             day_row = df_initial_shift[df_initial_shift['Date'] == d]
             
             for p in existing_members:
@@ -154,16 +177,19 @@ if check_password():
                 else:
                     raw_t = 'OFF'
                 
-                internal_t = disp_to_internal.get((raw_t, d_type), disp_to_internal.get((raw_t, 'All'), raw_t))
+                norm_t = normalize_task_id(raw_t)
                 
-                if internal_t not in tasks_master:
-                    tasks_master[internal_t] = {'TargetArea': '', 'FemaleAllowed': 'Y', 'Role': 'All', 'Load': 0}
-                    internal_to_disp[internal_t] = raw_t
-                if internal_t not in all_tasks:
-                    all_tasks.append(internal_t)
+                # Masterに登録がない場合のみ新規作成
+                if norm_t not in tasks_master and norm_t != 'OFF':
+                    tasks_master[norm_t] = {'TargetArea': '', 'FemaleAllowed': 'Y', 'Role': 'All', 'Load': 0}
+                    if norm_t not in all_tasks:
+                        all_tasks.append(norm_t)
 
-                initial_assignment[(p, d)] = (raw_t, internal_t)
-                day_converted_tasks[d].append(internal_t)
+                if norm_t not in all_tasks and norm_t in tasks_master:
+                    all_tasks.append(norm_t)
+
+                initial_assignment[(p, d)] = (raw_t, norm_t)
+                day_converted_tasks[d].append(norm_t)
 
         x = {}
         for p in existing_members:
@@ -176,13 +202,13 @@ if check_password():
             d_type = day_type_map.get(d, 'Weekday')
             
             for p in existing_members:
-                raw_t, internal_t = initial_assignment[(p, d)]
+                raw_t, norm_t = initial_assignment[(p, d)]
 
-                if raw_t == 'OFF' or internal_t == 'OFF':
+                if raw_t == 'OFF' or norm_t == 'OFF':
                     if 'OFF' in all_tasks:
                         model.Add(x[p, d, 'OFF'] == 1)
-                elif raw_t in SPECIAL_DUTIES or internal_t in SPECIAL_DUTIES or d_type == 'Fixed':
-                    model.Add(x[p, d, internal_t] == 1)
+                elif raw_t in SPECIAL_DUTIES or norm_t in SPECIAL_DUTIES or d_type == 'Fixed':
+                    model.Add(x[p, d, norm_t] == 1)
 
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
@@ -201,12 +227,12 @@ if check_password():
                 for t_id in all_tasks:
                     t_info = get_task_info(t_id)
                     t_female_allowed = clean_str(t_info.get('FemaleAllowed', 'Y')).upper()
-                    t_role = clean_str(t_info.get('Role', 'All')).upper()
                     
-                    disp_t = internal_to_disp.get(t_id, t_id)
-                    if disp_t.endswith('M'):
+                    disp_t = get_disp_name(t_id)
+                    t_role = 'All'
+                    if disp_t.endswith('M') or t_id.startswith('M_'):
                         t_role = 'M'
-                    elif disp_t.endswith('C'):
+                    elif disp_t.endswith('C') or t_id.startswith('C_'):
                         t_role = 'C'
 
                     if p_gender == 'F' and t_female_allowed == 'N':
@@ -220,7 +246,6 @@ if check_password():
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
-            next_d_type = day_type_map.get(d_next, 'Weekday')
             
             active_tasks_today = set(day_converted_tasks[d_curr])
             
@@ -231,16 +256,12 @@ if check_password():
                 pair_raw = clean_str(t_info.get('PairTaskID', ''))
                 
                 if pair_raw and pair_raw not in ['nan', 'None', '']:
-                    resolved_pair_id = disp_to_internal.get(
-                        (pair_raw, next_d_type), 
-                        disp_to_internal.get((pair_raw, 'All'), 
-                        disp_to_internal.get((f"M_{pair_raw}", next_d_type), pair_raw))
-                    )
+                    norm_pair_id = normalize_task_id(pair_raw)
                     
-                    if resolved_pair_id in all_tasks:
-                        pair_debug_logs.append(f"【ペア制約適用】{internal_to_disp.get(t_id, t_id)} ({d_curr}) ➔ {internal_to_disp.get(resolved_pair_id, resolved_pair_id)} ({d_next})")
+                    if norm_pair_id in all_tasks:
+                        pair_debug_logs.append(f"【ペア制約適用】{get_disp_name(t_id)} ({d_curr}) ➔ {get_disp_name(norm_pair_id, pair_raw)} ({d_next})")
                         for p in existing_members:
-                            model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
+                            model.Add(x[p, d_curr, t_id] == x[p, d_next, norm_pair_id])
 
         # -------------------------------------------------------------
         # 目的関数 ＆ デバッグデータ収集
@@ -251,11 +272,11 @@ if check_password():
         for p in existing_members:
             home_st = clean_str(members_info[p].get('BaseArea', '')).strip()
             for d in days:
-                raw_t, orig_int = initial_assignment[(p, d)]
-                if orig_int == 'OFF':
+                raw_t, orig_norm = initial_assignment[(p, d)]
+                if orig_norm == 'OFF':
                     continue
                 
-                t_info = get_task_info(orig_int)
+                t_info = get_task_info(orig_norm)
                 target_area = clean_str(t_info.get('TargetArea', '')).strip()
                 
                 score_debug_logs.append(
@@ -276,9 +297,9 @@ if check_password():
 
         for d in days:
             for p in existing_members:
-                _, orig_int = initial_assignment[(p, d)]
-                if orig_int in all_tasks:
-                    penalty_terms.append((1 - x[p, d, orig_int]) * 1)
+                _, orig_norm = initial_assignment[(p, d)]
+                if orig_norm in all_tasks:
+                    penalty_terms.append((1 - x[p, d, orig_norm]) * 1)
 
         if penalty_terms:
             model.Minimize(sum(penalty_terms))
@@ -295,11 +316,11 @@ if check_password():
                 for p in existing_members:
                     for t in all_tasks:
                         if (p, d, t) in x and solver.Value(x[p, d, t]) == 1:
-                            assigned_disp = internal_to_disp.get(t, t)
+                            assigned_disp = get_disp_name(t)
                             row[p] = assigned_disp
                             
-                            orig_raw, orig_int = initial_assignment[(p, d)]
-                            if assigned_disp != orig_raw and orig_raw != 'OFF':
+                            orig_raw, orig_norm = initial_assignment[(p, d)]
+                            if t != orig_norm and orig_norm != 'OFF':
                                 change_logs.append(f"【{d}】{p} : {orig_raw} ➔ {assigned_disp}")
                             break
                 result_rows.append(row)
