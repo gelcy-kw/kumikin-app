@@ -167,7 +167,7 @@ if check_password():
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
         # -------------------------------------------------------------
-        # 制約条件の設定
+        # 制約条件の設定（ハード制約）
         # -------------------------------------------------------------
 
         # 1. 1人1日1仕業
@@ -227,8 +227,28 @@ if check_password():
                     for p in existing_members:
                         model.Add(x[p, d_next, work_next_required] == 1).OnlyEnforceIf(x[p, d_curr, work_curr])
 
-        # 7. 連続2日間の勤務場所（TargetArea）の一致制約
-        # 連続出勤する2日間において、異なる出勤エリア（例: Akaike ➔ Joshin）への日替わり勤務を禁止
+        # -------------------------------------------------------------
+        # 目的関数: エリア最適化・連続エリア不一致抑制・シフト変更抑制
+        # -------------------------------------------------------------
+        objective_terms = []
+
+        # ① 個別日の所属エリア不一致ペナルティ (+1000)
+        # ② 不要なシフト変更ペナルティ (+1)
+        for p in existing_members:
+            p_base_area = member_base_area.get(p, '')
+            for d in dates:
+                orig_t = initial_assignment.get((p, d), 'OFF')
+                for t in all_tasks:
+                    t_area = get_task_area(t)
+                    
+                    if p_base_area and t_area and t_area != 'ANY' and p_base_area != t_area:
+                        objective_terms.append(x[p, d, t] * 1000)
+                    
+                    if t != orig_t:
+                        objective_terms.append(x[p, d, t] * 1)
+
+        # ③ 連続2日間のエリア跨ぎ（日替わり出勤）に対する強いペナルティ (+2000)
+        # これにより、ハード制約でエラーを出さずに「出勤地が日替わりになる不適切なトレード」を回避する
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -243,28 +263,12 @@ if check_password():
                         if area2 == 'ANY':
                             continue
                         
-                        # TargetAreaが異なっている（Akaike ⇄ Joshin）場合は連続割当を禁止
+                        # TargetAreaが異なる（Akaike ⇄ Joshin）ペアが発生する場合に大きなペナルティを付与
                         if area1 != area2:
-                            model.AddBoolOr([x[p, d_curr, t1].Not(), x[p, d_next, t2].Not()])
-
-        # -------------------------------------------------------------
-        # 目的関数: エリア不一致コストの最小化 & 不要な変更の抑制
-        # -------------------------------------------------------------
-        objective_terms = []
-        for p in existing_members:
-            p_base_area = member_base_area.get(p, '')
-            for d in dates:
-                orig_t = initial_assignment.get((p, d), 'OFF')
-                for t in all_tasks:
-                    t_area = get_task_area(t)
-                    
-                    # ① エリア不一致に対する強いペナルティ (+1000)
-                    if p_base_area and t_area and t_area != 'ANY' and p_base_area != t_area:
-                        objective_terms.append(x[p, d, t] * 1000)
-                    
-                    # ② 不要なシフト変更への軽微なペナルティ (+1)
-                    if t != orig_t:
-                        objective_terms.append(x[p, d, t] * 1)
+                            both_selected = model.NewBoolVar(f'area_mismatch_{p}_{d_curr}_{t1}_{t2}')
+                            model.AddBoolAnd([x[p, d_curr, t1], x[p, d_next, t2]]).OnlyEnforceIf(both_selected)
+                            model.AddBoolOr([x[p, d_curr, t1].Not(), x[p, d_next, t2].Not()]).OnlyEnforceIf(both_selected.Not())
+                            objective_terms.append(both_selected * 2000)
 
         model.Minimize(sum(objective_terms))
 
