@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import re
 from ortools.sat.python import cp_model
 
 # ページ基本設定
@@ -38,6 +39,15 @@ if check_password():
     file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"])
     file_tasks = st.file_uploader("仕業マスター (Task_Master.csv)", type=["csv"])
     file_initial = st.file_uploader("初期勤務表 (Initial_Schedule.csv)", type=["csv"])
+
+    def normalize_task_id(raw_task):
+        """15M -> M_15, 74C -> C_74 のように正規化、それ以外(A1, OFF等)はそのまま"""
+        s = str(raw_task).strip()
+        m = re.match(r'^(\d+)([MC])$', s, re.IGNORECASE)
+        if m:
+            num, role = m.groups()
+            return f"{role.upper()}_{num}"
+        return s
 
     def run_optimization(df_members, df_tasks, df_initial_raw):
         header_col = df_initial_raw.columns[0]
@@ -85,20 +95,27 @@ if check_password():
         tasks_master = df_tasks.set_index('TaskID').to_dict('index')
         all_tasks = list(tasks_master.keys())
 
-        # IDマッピング
+        # マッピング用辞書の構築
         disp_to_internal = {}
         internal_to_disp = {}
+        
         for t_id, t_info in tasks_master.items():
-            parts = t_id.split('_')
-            disp_no = f"{parts[0]}_{parts[1]}" if len(parts) >= 3 else parts[0]
             d_type = str(t_info.get('DayType', 'All')).strip()
             
-            disp_to_internal[(disp_no, d_type)] = t_id
-            disp_to_internal[(disp_no, 'All')] = t_id
+            # 正規化IDと元IDの両方でマッピング
             disp_to_internal[(t_id, d_type)] = t_id
             disp_to_internal[(t_id, 'All')] = t_id
             
-            internal_to_disp[t_id] = disp_no
+            # 15M / M_15 表記双方向マッピング
+            m = re.match(r'^([MC])_(\d+)$', t_id)
+            if m:
+                role, num = m.groups()
+                alt_id = f"{num}{role}" #例: 15M
+                disp_to_internal[(alt_id, d_type)] = t_id
+                disp_to_internal[(alt_id, 'All')] = t_id
+                internal_to_disp[t_id] = alt_id # 表示時は15M形式に統一
+            else:
+                internal_to_disp[t_id] = t_id
 
         SPECIAL_DUTIES = (
             [f"A{i}" for i in range(1, 8)] +
@@ -130,14 +147,15 @@ if check_password():
                 else:
                     raw_t = 'OFF'
                 
-                # 内部タスクIDへ変換（マッチしなければ raw_t のまま）
+                # 内部タスクIDへ変換
                 internal_t = disp_to_internal.get((raw_t, d_type), disp_to_internal.get((raw_t, 'All'), raw_t))
                 
-                # もしマッピング漏れがあれば全タスクリストに緊急追加（Infeasible防止）
+                # もし Task_Master に存在しないタスクが初期配置にあった場合動的登録（Infeasible完全防止）
                 if internal_t not in all_tasks:
                     all_tasks.append(internal_t)
                     tasks_master[internal_t] = {'TargetArea': '', 'FemaleAllowed': 'Y', 'Role': 'All', 'Load': 0}
                     x[p, d, internal_t] = model.NewBoolVar(f'x_{p}_{d}_{internal_t}')
+                    internal_to_disp[internal_t] = raw_t
 
                 converted_day_tasks.append(internal_t)
                 initial_assignment[(p, d)] = (raw_t, internal_t)
@@ -161,7 +179,7 @@ if check_password():
                 model.Add(sum(x[p, d, t] for p in existing_members if (p, d, t) in x) == count)
 
         # -------------------------------------------------------------
-        # 新規トレードのみに対する不適合ガード（トレード拒否ロジック）
+        # 新規トレードのみに対する不適合ガード
         # -------------------------------------------------------------
         for p in existing_members:
             p_gender = str(members_info[p].get('Gender', 'M')).strip()
@@ -171,7 +189,6 @@ if check_password():
                 raw_t, init_t = initial_assignment[(p, d)]
                 
                 for t_id in all_tasks:
-                    # 初期配置と同一のタスクへの割り当ては無条件で許可（トレードなし）
                     if t_id == init_t or t_id == raw_t:
                         continue
                         
@@ -179,20 +196,18 @@ if check_password():
                     t_female_allowed = str(t_info.get('FemaleAllowed', 'Y')).strip()
                     t_role = str(t_info.get('Role', 'All')).strip()
                     
-                    # 性別不適合への「新規変更」を禁止
                     if p_gender == 'F' and t_female_allowed == 'N':
                         model.Add(x[p, d, t_id] == 0)
                         
-                    # 資格不適合への「新規変更」を禁止
                     if (p_role == 'M' and t_role == 'C') or (p_role == 'C' and t_role == 'M'):
                         model.Add(x[p, d, t_id] == 0)
 
         # -------------------------------------------------------------
-        # 目的関数: 通勤コスト（拠点ミスマッチ）最小化
+        # 目的関数: ペナルティ最小化
         # -------------------------------------------------------------
         penalty_terms = []
 
-        # 1. 拠点ミスマッチペナルティ [第一優先: 1,000,000]
+        # 1. 拠点ミスマッチペナルティ [第一優先]
         for p in existing_members:
             home_st = str(members_info[p].get('BaseArea', '')).strip()
             for d in days:
@@ -204,7 +219,7 @@ if check_password():
                     if target_area and target_area != home_st:
                         penalty_terms.append(x[p, d, t_id] * 1000000)
 
-        # 2. 連続ペアタスク維持 [第二優先: 10,000]
+        # 2. 連続ペアタスク維持 [第二優先]
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -213,12 +228,9 @@ if check_password():
             for t_id, t_info in tasks_master.items():
                 pair_raw = str(t_info.get('PairTaskID', '')).strip()
                 if pair_raw and pair_raw != 'nan' and pair_raw != 'None':
-                    t_role_prefix = "M_" if t_id.startswith("M_") else ("C_" if t_id.startswith("C_") else "")
-                    pair_disp = f"{t_role_prefix}{pair_raw}" if t_role_prefix and not pair_raw.startswith(t_role_prefix) else pair_raw
-                    
                     resolved_pair_id = disp_to_internal.get(
-                        (pair_disp, next_d_type), 
-                        disp_to_internal.get((pair_disp, 'All'), pair_raw)
+                        (pair_raw, next_d_type), 
+                        disp_to_internal.get((pair_raw, 'All'), pair_raw)
                     )
                     
                     if resolved_pair_id in all_tasks:
@@ -228,7 +240,7 @@ if check_password():
                             model.AddBoolOr([x[p, d_curr, t_id].Not(), x[p, d_next, resolved_pair_id]]).OnlyEnforceIf(pair_violation.Not())
                             penalty_terms.append(pair_violation * 10000)
 
-        # 3. Late-Early 回避 [第三優先: 1,000]
+        # 3. Late-Early 回避 [第三優先]
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -242,7 +254,7 @@ if check_password():
                                 model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
                                 penalty_terms.append(late_early * 1000)
 
-        # 4. 負荷平準化 [第四優先: 1]
+        # 4. 負荷平準化 [第四優先]
         for p in existing_members:
             p_diff = sum(x[p, d, t] * int(tasks_master.get(t, {}).get('Load', 0)) for d in days for t in all_tasks if (p, d, t) in x)
             penalty_terms.append(p_diff)
