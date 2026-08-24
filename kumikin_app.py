@@ -36,13 +36,6 @@ def clean_str(val):
         return ""
     return str(val).strip()
 
-def extract_base_task_id(task_code):
-    """ '15M', '16M', '60C' 等の表記からTask_MasterのTaskID表記に対応させる検索用文字列抽出 """
-    if not task_code or task_code == 'OFF':
-        return 'OFF'
-    m = re.search(r'([A-Za-z0-9_]+)', task_code)
-    return m.group(1) if m else task_code
-
 if check_password():
     st.title("勤務変更補助システム")
     st.caption("自動シフトトレード・エリア最適化ソルバー")
@@ -54,11 +47,10 @@ if check_password():
 
     def run_optimization(df_members, df_tasks, df_initial_raw):
         header_col = df_initial_raw.columns[0]
-        
         dates = [clean_str(c) for c in df_initial_raw.columns[1:]]
 
         # -------------------------------------------------------------
-        # マスター情報のマッピング構築
+        # 1. メンバーマスターのパース (MemberID ➔ BaseArea)
         # -------------------------------------------------------------
         df_members['MemberID'] = df_members['MemberID'].apply(clean_str)
         member_base_area = {}
@@ -69,15 +61,43 @@ if check_password():
 
         members = list(member_base_area.keys())
 
-        # 仕業エリアのマッピング (TaskID から TargetArea へ)
-        task_target_area = {'OFF': 'ANY'}
+        # -------------------------------------------------------------
+        # 2. 仕業マスターのパース (数字と種別 M/C から TargetArea を特定)
+        # -------------------------------------------------------------
+        # 例: ("15", "M") -> "Akaike", ("60", "M") -> "Joshin"
+        task_area_map = {}
         if 'TaskID' in df_tasks.columns and 'TargetArea' in df_tasks.columns:
             for _, row in df_tasks.iterrows():
                 t_id = clean_str(row['TaskID'])
                 t_area = clean_str(row['TargetArea'])
-                task_target_area[t_id] = t_area
+                
+                # M_15_W や C_60_W から プレフィックス(M/C) と 数字(15/60) を抽出
+                m = re.match(r'([MC])_(\d+)', t_id)
+                if m:
+                    prefix = m.group(1)
+                    num = m.group(2)
+                    task_area_map[(num, prefix)] = t_area
 
-        # 初期シフトデータのインデックス化
+        def get_task_area(task_code):
+            if not task_code or task_code == 'OFF':
+                return 'ANY'
+            # 15M -> num="15", prefix="M"
+            m = re.match(r'(\d+)([MC])', task_code)
+            if m:
+                num = m.group(1)
+                prefix = m.group(2)
+                return task_area_map.get((num, prefix), 'ANY')
+            # C15 などのパターン
+            m = re.match(r'([MC])(\d+)', task_code)
+            if m:
+                prefix = m.group(1)
+                num = m.group(2)
+                return task_area_map.get((num, prefix), 'ANY')
+            return 'ANY'
+
+        # -------------------------------------------------------------
+        # 3. 初期勤務表データの整理
+        # -------------------------------------------------------------
         df_members_sched = df_initial_raw[df_initial_raw[header_col].apply(clean_str) != 'DayType'].copy()
         df_members_sched[header_col] = df_members_sched[header_col].apply(clean_str)
 
@@ -88,9 +108,6 @@ if check_password():
         if len(existing_members) == 0:
             return df_initial_raw, False, "メンバーID不一致", [], [], [], []
 
-        # -------------------------------------------------------------
-        # 初期勤務表の取得と全仕業のリスト化
-        # -------------------------------------------------------------
         initial_assignment = {}
         all_tasks_set = set(['OFF'])
 
@@ -102,24 +119,6 @@ if check_password():
                     all_tasks_set.add(val)
 
         all_tasks = list(all_tasks_set)
-
-        # -------------------------------------------------------------
-        # 各仕業の TargetArea 判定ヘルパー
-        # -------------------------------------------------------------
-        def get_task_area(task_code):
-            if task_code == 'OFF':
-                return 'ANY'
-            # Task_Master内を直接マッチ、または末尾の _W / _H 等を除去してマッチ試行
-            for tid, area in task_target_area.items():
-                if tid in task_code or task_code in tid:
-                    return area
-                # 数字+記号のパターン（例: 15M, 16M, 60M, 46Cなど）
-                num_part = re.search(r'\d+', task_code)
-                tid_num = re.search(r'\d+', tid)
-                if num_part and tid_num and num_part.group() == tid_num.group():
-                    if task_code[0] == tid[0]: # M or C
-                        return area
-            return 'ANY'
 
         # ペア制約ルールの定義（1日目 ➔ 2日目）
         pair_rules = {
@@ -149,35 +148,39 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 制約2: 各日に必要な仕業の人数（需要数）を元データから維持する（重複防止）
+        # 制約2: 各日に必要な仕業の人数（需要数）を維持
         for d in dates:
             tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
             for t in all_tasks:
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # -------------------------------------------------------------
-        # ペア制約の適用（1日目work_currを担当した人は翌日work_next_requiredになる）
-        # -------------------------------------------------------------
+        # 制約3: ペア制約（誰であれ、当日work_currを担当したら翌日はwork_next_requiredになる）
         pair_debug_logs = []
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
 
+            for work_curr, work_next_required in pair_rules.items():
+                if work_curr in all_tasks and work_next_required in all_tasks:
+                    for p in existing_members:
+                        # pさんが当日work_currなら翌日work_next_required
+                        model.Add(x[p, d_next, work_next_required] == 1).OnlyEnforceIf(x[p, d_curr, work_curr])
+
+        # 初期シフトで適用されていたペア制約のログ記録
+        for d_idx in range(len(dates) - 1):
+            d_curr = dates[d_idx]
+            d_next = dates[d_idx + 1]
             for p in existing_members:
                 work_curr = initial_assignment.get((p, d_curr), "")
-                
-                # ペア前段に当てはまる場合
                 if work_curr in pair_rules:
                     work_next_required = pair_rules[work_curr]
                     pair_debug_logs.append(
                         f"【ペア制約適用】{p}さん: {work_curr} ({d_curr}) ➔ 翌日必ず {work_next_required} ({d_next})"
                     )
-                    # 当日work_currをやった人は、翌日必ずwork_next_required
-                    model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
         # -------------------------------------------------------------
-        # 目的関数: エリア不一致のコスト最小化 ＋ 初期シフト維持ボーナス
+        # 4. 目的関数: エリア不一致コストの最小化
         # -------------------------------------------------------------
         objective_terms = []
         
@@ -190,14 +193,12 @@ if check_password():
                 for t in all_tasks:
                     t_area = get_task_area(t)
                     
-                    # 1. エリア不一致コスト (BaseArea と TargetArea が異なる場合)
+                    # エリア不一致ペナルティ（所属と仕業エリアが異なる場合）
                     if p_base_area and t_area and t_area != 'ANY' and p_base_area != t_area:
-                        # エリアが違えば大ペナルティ（1000点）
                         objective_terms.append(x[p, d, t] * 1000)
                     
-                    # 2. 初期シフト維持インセンティブ
+                    # 初期シフト維持ボーナス（無駄な変更を防ぐ）
                     if t == orig_t:
-                        # 元のシフトを維持できたらボーナス（-10点）
                         objective_terms.append(x[p, d, t] * -10)
 
         model.Minimize(sum(objective_terms))
