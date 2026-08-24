@@ -127,7 +127,7 @@ if check_password():
         
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
-            return df_initial_raw, False, "メンバーIDが一致しませんでした", [], [], [], [], {}
+            return df_initial_raw, False, "メンバーIDが一致しませんでした", [], [], [], [], set(), ""
 
         initial_assignment = {}
         all_tasks_set = set(['OFF'])
@@ -183,7 +183,23 @@ if check_password():
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, orig_t] == 1)
 
-        # 3. 役職（Role）マッチング制約
+        # 3. 所属エリア一致制約（他エリアの仕業割り当てを絶対禁止！）
+        for p in existing_members:
+            p_base_area = member_base_area.get(p, '')
+            if not p_base_area or p_base_area == 'ANY':
+                continue
+            for d in dates:
+                orig_t = initial_assignment.get((p, d), 'OFF')
+                for t in all_tasks:
+                    if is_fixed_task(t):
+                        continue
+                    t_area = get_task_area(t)
+                    # 初期シフトで元々割り当たっていない他エリアの仕業は禁止
+                    if t_area and t_area != 'ANY' and t_area != p_base_area:
+                        if t != orig_t:
+                            model.Add(x[p, d, t] == 0)
+
+        # 4. 役職（Role）マッチング制約
         for p in existing_members:
             p_role = member_role.get(p, '')
             for d in dates:
@@ -195,7 +211,7 @@ if check_password():
                     elif p_role == 'C' and t.endswith('M'):
                         model.Add(x[p, d, t] == 0)
 
-        # 4. 女性（Gender = F）の割り当て不可（FemaleAllowed = N）ガード制約
+        # 5. 女性（Gender = F）の割り当て不可（FemaleAllowed = N）ガード制約
         for p in existing_members:
             p_gender = member_gender.get(p, '')
             if p_gender == 'F':
@@ -206,7 +222,7 @@ if check_password():
                         if not is_female_allowed(t):
                             model.Add(x[p, d, t] == 0)
 
-        # 5. 各日の出勤仕業の人数（需要数）を維持
+        # 6. 各日の出勤仕業の人数（需要数）を維持
         for d in dates:
             tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
             for t in all_tasks:
@@ -215,7 +231,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 6. ペア制約（連番仕業）
+        # 7. ペア制約（連番仕業）：双方向一致
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -223,48 +239,18 @@ if check_password():
             for work_curr, work_next_required in pair_rules.items():
                 if work_curr in all_tasks and work_next_required in all_tasks:
                     for p in existing_members:
-                        model.Add(x[p, d_next, work_next_required] == 1).OnlyEnforceIf(x[p, d_curr, work_curr])
+                        model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
         # -------------------------------------------------------------
-        # 目的関数: エリア最適化・連続エリア不一致抑制・シフト変更抑制
+        # 目的関数: 不要なシフト変更の抑制
         # -------------------------------------------------------------
         objective_terms = []
-
-        # ① 個別日の所属エリア不一致ペナルティ (+1000)
-        # ② 不要なシフト変更ペナルティ (+1)
         for p in existing_members:
-            p_base_area = member_base_area.get(p, '')
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
                 for t in all_tasks:
-                    t_area = get_task_area(t)
-                    
-                    if p_base_area and t_area and t_area != 'ANY' and p_base_area != t_area:
-                        objective_terms.append(x[p, d, t] * 1000)
-                    
                     if t != orig_t:
                         objective_terms.append(x[p, d, t] * 1)
-
-        # ③ 連続2日間のエリア跨ぎ（日替わり出勤）に対する強いペナルティ (+2000)
-        for d_idx in range(len(dates) - 1):
-            d_curr = dates[d_idx]
-            d_next = dates[d_idx + 1]
-
-            for p in existing_members:
-                for t1 in all_tasks:
-                    area1 = get_task_area(t1)
-                    if area1 == 'ANY':
-                        continue
-                    for t2 in all_tasks:
-                        area2 = get_task_area(t2)
-                        if area2 == 'ANY':
-                            continue
-                        
-                        if area1 != area2:
-                            both_selected = model.NewBoolVar(f'area_mismatch_{p}_{d_curr}_{t1}_{t2}')
-                            model.AddBoolAnd([x[p, d_curr, t1], x[p, d_next, t2]]).OnlyEnforceIf(both_selected)
-                            model.AddBoolOr([x[p, d_curr, t1].Not(), x[p, d_next, t2].Not()]).OnlyEnforceIf(both_selected.Not())
-                            objective_terms.append(both_selected * 2000)
 
         model.Minimize(sum(objective_terms))
 
@@ -274,7 +260,7 @@ if check_password():
 
         change_logs = []
         pair_applied_logs = []
-        changed_cells = set() # (MemberID, Date) のセット
+        changed_cells = set()
 
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             final_schedule = {}
@@ -287,7 +273,7 @@ if check_password():
                             if t != orig_t:
                                 p_name = member_names.get(p, p)
                                 change_logs.append(f"【{d}】{p_name}さん({p}) : {orig_t} ➔ {t}")
-                                changed_cells.add((p, d)) # 変更箇所を記録
+                                changed_cells.add((p, d))
                             break
 
             result_rows = []
@@ -344,15 +330,12 @@ if check_password():
                     st.subheader("📊 最適化結果プレビュー")
                     st.caption("※ 初期シフトから変更された箇所は **黄緑色** にハイライトされます")
 
-                    # セルハイライト関数の定義
                     def highlight_changes(df):
-                        # 空のスタイルDataFrameを作成
                         style_df = pd.DataFrame('', index=df.index, columns=df.columns)
                         for idx, row in df.iterrows():
                             p_id = str(row[id_col])
                             for col in df.columns:
                                 if (p_id, str(col)) in changed_cells:
-                                    # 変更箇所を明るい黄緑色（#d4edda）と太字で目立たせる
                                     style_df.loc[idx, col] = 'background-color: #d4edda; color: #155724; font-weight: bold;'
                         return style_df
 
