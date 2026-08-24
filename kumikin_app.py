@@ -8,7 +8,13 @@ def solve_shift_scheduling():
     # ---------------------------------------------------------
     # ※ファイルパスは環境に合わせて変更してください
     try:
-        df_initial = pd.read_csv('Initial_Schedule.csv')
+        def load_csv_safely(file_path):
+    try:
+        return pd.read_csv(file_path, encoding='utf-8')
+    except (UnicodeDecodeError, pd.errors.ParserError):
+        return pd.read_csv(file_path, encoding='cp932')
+
+df_initial = load_csv_safely('Initial_Schedule.csv')
     except FileNotFoundError:
         print("エラー: Initial_Schedule.csv が見つかりません。")
         return
