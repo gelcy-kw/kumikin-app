@@ -49,7 +49,7 @@ if check_password():
         day_types_row = df_initial_raw[df_initial_raw[header_col].astype(str).str.strip() == 'DayType']
         if day_types_row.empty:
             st.error("エラー: Initial_Schedule.csv に 'DayType' 行が見つかりません。")
-            return df_initial_raw, False, "DayType行なし", []
+            return df_initial_raw, False, "DayType行なし", [], []
         
         dates = [clean_str(c) for c in df_initial_raw.columns[1:]]
         day_type_map = {}
@@ -70,7 +70,7 @@ if check_password():
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
             st.error("エラー: Initial_Schedule.csv のメンバーIDが Member_Master と一致しません。")
-            return df_initial_raw, False, "メンバーID不一致", []
+            return df_initial_raw, False, "メンバーID不一致", [], []
             
         df_initial_indexed = df_initial_indexed.loc[existing_members]
 
@@ -85,6 +85,7 @@ if check_password():
         tasks_master = df_tasks.set_index('TaskID').to_dict('index')
         all_tasks = list(tasks_master.keys())
 
+        # IDの相互変換マッピング（柔軟なマッチング）
         disp_to_internal = {}
         internal_to_disp = {}
         
@@ -93,6 +94,7 @@ if check_password():
             disp_to_internal[(t_id, d_type)] = t_id
             disp_to_internal[(t_id, 'All')] = t_id
             
+            # M_15 <-> 15M の相互変換対応
             m = re.match(r'^([MC])_(\d+)$', t_id)
             if m:
                 role, num = m.groups()
@@ -101,6 +103,12 @@ if check_password():
                 disp_to_internal[(alt_id, 'All')] = t_id
                 internal_to_disp[t_id] = alt_id
             else:
+                m2 = re.match(r'^(\d+)([MC])$', t_id)
+                if m2:
+                    num, role = m2.groups()
+                    alt_id = f"{role}_{num}"
+                    disp_to_internal[(alt_id, d_type)] = t_id
+                    disp_to_internal[(alt_id, 'All')] = t_id
                 internal_to_disp[t_id] = t_id
 
         SPECIAL_DUTIES = (
@@ -160,16 +168,16 @@ if check_password():
                 count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == count)
 
-        # 属性不適合の完全ガード（TaskIDの末尾文字 M/C も判定）
+        # 属性不適合の完全ガード
         for p in existing_members:
-            p_gender = clean_str(members_info[p].get('Gender', 'M'))
-            p_role = clean_str(members_info[p].get('Role', 'MC'))
+            p_gender = clean_str(members_info[p].get('Gender', 'M')).upper()
+            p_role = clean_str(members_info[p].get('Role', 'MC')).upper()
             
             for d in days:
                 for t_id in all_tasks:
                     t_info = tasks_master.get(t_id, {})
-                    t_female_allowed = clean_str(t_info.get('FemaleAllowed', 'Y'))
-                    t_role = clean_str(t_info.get('Role', 'All'))
+                    t_female_allowed = clean_str(t_info.get('FemaleAllowed', 'Y')).upper()
+                    t_role = clean_str(t_info.get('Role', 'All')).upper()
                     
                     disp_t = internal_to_disp.get(t_id, t_id)
                     if disp_t.endswith('M'):
@@ -183,7 +191,8 @@ if check_password():
                     if (p_role == 'M' and t_role == 'C') or (p_role == 'C' and t_role == 'M'):
                         model.Add(x[p, d, t_id] == 0)
 
-        # ペア仕業（一泊二日）のハード制約
+        # ペア仕業（一泊二日）のハード制約＆デバッグログ作成
+        pair_debug_logs = []
         for d_idx in range(len(days) - 1):
             d_curr = days[d_idx]
             d_next = days[d_idx + 1]
@@ -192,59 +201,46 @@ if check_password():
             for t_id, t_info in tasks_master.items():
                 pair_raw = clean_str(t_info.get('PairTaskID', ''))
                 if pair_raw and pair_raw not in ['nan', 'None', '']:
+                    # 表記揺れ（16M, M_16 等）を包括解決
                     resolved_pair_id = disp_to_internal.get(
                         (pair_raw, next_d_type), 
-                        disp_to_internal.get((pair_raw, 'All'), pair_raw)
+                        disp_to_internal.get((pair_raw, 'All'), 
+                        disp_to_internal.get((f"M_{pair_raw}", next_d_type), pair_raw))
                     )
                     
                     if resolved_pair_id in all_tasks:
+                        pair_debug_logs.append(f"【ペア検出】{t_id} ({d_curr}) ➔ {resolved_pair_id} ({d_next})")
                         for p in existing_members:
                             model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
         # -------------------------------------------------------------
-        # 目的関数（重み付けの論理再構築）
+        # 目的関数（拠点マッチング評価）
         # -------------------------------------------------------------
         penalty_terms = []
 
-        # 1. 拠点適合度評価（ミスマッチには大ペナルティ、適合にはボーナス評価）
         for p in existing_members:
-            home_st = clean_str(members_info[p].get('BaseArea', ''))
+            home_st = clean_str(members_info[p].get('BaseArea', '')).lower()
             for d in days:
                 for t_id in all_tasks:
                     if t_id == 'OFF':
                         continue
                     t_info = tasks_master.get(t_id, {})
-                    target_area = clean_str(t_info.get('TargetArea', ''))
+                    target_area = clean_str(t_info.get('TargetArea', '')).lower()
                     
                     if home_st and target_area:
                         if target_area != home_st:
-                            # ミスマッチ状態: 1,000点ペナルティ
-                            penalty_terms.append(x[p, d, t_id] * 1000)
+                            # 拠点ミスマッチ（大ペナルティ）
+                            penalty_terms.append(x[p, d, t_id] * 10000)
                         else:
-                            # 適合状態: 100点ボーナス（スコアを下げる）
-                            penalty_terms.append(x[p, d, t_id] * (-100))
+                            # 拠点適合（ボーナス評価）
+                            penalty_terms.append(x[p, d, t_id] * (-1000))
 
-        # 2. 初期シフトからのトレードタイブレーク（1点）
-        # 同一条件（スコア変化なし）での無駄なスクランブルトレードのみを抑制
+        # トレード抑制タイブレーク（1点）
         for d in days:
             for p in existing_members:
                 _, orig_int = initial_assignment[(p, d)]
                 if orig_int in all_tasks:
                     penalty_terms.append((1 - x[p, d, orig_int]) * 1)
-
-        # 3. Late-Early (遅番→早番) 回避 [50点]
-        for d_idx in range(len(days) - 1):
-            d_curr = days[d_idx]
-            d_next = days[d_idx + 1]
-            for p in existing_members:
-                for t1_id, t1_info in tasks_master.items():
-                    if clean_str(t1_info.get('EndType')) == 'Late':
-                        for t2_id, t2_info in tasks_master.items():
-                            if clean_str(t2_info.get('StartType')) == 'Early':
-                                late_early = model.NewBoolVar(f'le_{p}_{d_curr}_{t1_id}_{t2_id}')
-                                model.AddBoolAnd([x[p, d_curr, t1_id], x[p, d_next, t2_id]]).OnlyEnforceIf(late_early)
-                                model.AddBoolOr([x[p, d_curr, t1_id].Not(), x[p, d_next, t2_id].Not()]).OnlyEnforceIf(late_early.Not())
-                                penalty_terms.append(late_early * 50)
 
         if penalty_terms:
             model.Minimize(sum(penalty_terms))
@@ -289,9 +285,9 @@ if check_password():
             df_dt_row = pd.DataFrame([day_type_output_row])
             df_result_final = pd.concat([df_dt_row, df_result_horiz], ignore_index=True)
             
-            return df_result_final, True, "OK", change_logs
+            return df_result_final, True, "OK", change_logs, pair_debug_logs
         else:
-            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", []
+            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], pair_debug_logs
 
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
@@ -301,7 +297,7 @@ if check_password():
                 df_t = load_csv_safely(file_tasks)
                 df_i = load_csv_safely(file_initial)
                 
-                result_df, success, log_msg, change_logs = run_optimization(df_m, df_t, df_i)
+                result_df, success, log_msg, change_logs, pair_debug_logs = run_optimization(df_m, df_t, df_i)
                 
                 if success:
                     st.success("最適化計算が正常に完了しました！")
@@ -312,6 +308,10 @@ if check_password():
                             st.write(log)
                     else:
                         st.info("ℹ️ 条件を満たす効果的なトレードが存在しなかったため、無駄な変更を行わず初期シフトを維持しました。")
+
+                    with st.expander("🔍 内部ペア検出ログ（デバッグ用）"):
+                        for p_log in list(set(pair_debug_logs)):
+                            st.write(p_log)
 
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
                     st.download_button(
