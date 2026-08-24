@@ -35,6 +35,18 @@ def clean_str(val):
         return ""
     return str(val).strip().upper()
 
+def is_fixed_task(task_code):
+    """
+    OFF または アルファベットから始まる特殊仕業（A1-A7, J1-J6, R1-R6, S1-S3等）を
+    自動的に固定（トレード不可）判定する関数
+    """
+    if not task_code or task_code == 'OFF':
+        return True
+    # 数字で始まらない仕業（例: A1, J5, R3, S2 など）はすべて固定扱い
+    if not task_code[0].isdigit():
+        return True
+    return False
+
 if check_password():
     st.title("勤務変更補助システム")
     st.caption("自動シフトトレード・エリア最適化ソルバー")
@@ -45,13 +57,12 @@ if check_password():
     file_initial = st.file_uploader("初期勤務表 (Initial_Schedule.csv)", type=["csv"])
 
     def run_optimization(df_members, df_tasks, df_initial_raw):
-        # 列の解析: 1列目=MemberID, 2列目=Name, 3列目以降=日付
         id_col_name = df_initial_raw.columns[0]
         name_col_name = df_initial_raw.columns[1]
         dates = [clean_str(c) for c in df_initial_raw.columns[2:]]
 
         # -------------------------------------------------------------
-        # 1. メンバーマスターのパース (BaseArea & Role 取得)
+        # 1. メンバーマスターのパース
         # -------------------------------------------------------------
         df_members['MemberID'] = df_members['MemberID'].apply(clean_str)
         member_base_area = {}
@@ -82,7 +93,7 @@ if check_password():
                     task_area_map[(num, prefix)] = t_area
 
         def get_task_area(task_code):
-            if not task_code or task_code == 'OFF':
+            if is_fixed_task(task_code):
                 return 'ANY'
             m = re.match(r'(\d+)([MC])', task_code)
             if m:
@@ -158,27 +169,25 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 2. 初期シフトで OFF の日は絶対に OFF
+        # ★ 2. OFF および 特殊仕業（アルファベット開始）の絶対固定制約
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
-                if orig_t == 'OFF':
+                if is_fixed_task(orig_t):
                     for t in all_tasks:
-                        if t != 'OFF':
+                        if t != orig_t:
                             model.Add(x[p, d, t] == 0)
-                    model.Add(x[p, d, 'OFF'] == 1)
+                    model.Add(x[p, d, orig_t] == 1)
 
-        # ★【追加】3. 役職（Role）マッチング制約 (ハード制約)
+        # 3. 役職（Role）マッチング制約
         for p in existing_members:
             p_role = member_role.get(p, '')
             for d in dates:
                 for t in all_tasks:
-                    if t in ['OFF', 'A1', 'S2', 'S3', 'J5', 'J6']:
+                    if is_fixed_task(t):
                         continue
-                    # Role: M の人は C仕業（末尾C）を担当禁止
                     if p_role == 'M' and t.endswith('C'):
                         model.Add(x[p, d, t] == 0)
-                    # Role: C の人は M仕業（末尾M）を担当禁止
                     elif p_role == 'C' and t.endswith('M'):
                         model.Add(x[p, d, t] == 0)
 
@@ -186,7 +195,7 @@ if check_password():
         for d in dates:
             tasks_today = [initial_assignment.get((p, d), 'OFF') for p in existing_members]
             for t in all_tasks:
-                if t == 'OFF':
+                if is_fixed_task(t):
                     continue
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
@@ -217,7 +226,6 @@ if check_password():
                         objective_terms.append(x[p, d, t] * 1000)
                     
                     # ② 不要なシフト変更への軽微なペナルティ (+1)
-                    # (エリア解消のトレードなら -1000 の効果があるので余裕でトレードされる)
                     if t != orig_t:
                         objective_terms.append(x[p, d, t] * 1)
 
