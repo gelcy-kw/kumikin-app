@@ -36,7 +36,7 @@ def clean_str(val):
 
 if check_password():
     st.title("勤務変更補助システム")
-    st.caption("自動シフトトレード・制約最適化ソルバー（デバッグモード）")
+    st.caption("自動シフトトレード・制約最適化ソルバー")
 
     st.subheader("1. データファイルのアップロード")
     file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"])
@@ -85,7 +85,7 @@ if check_password():
         tasks_master = df_tasks.set_index('TaskID').to_dict('index')
         all_tasks = list(tasks_master.keys())
 
-        # IDの相互変換マッピング
+        # ID相互変換テーブルと情報検索関数の定義
         disp_to_internal = {}
         internal_to_disp = {}
         
@@ -109,6 +109,25 @@ if check_password():
                     disp_to_internal[(alt_id, d_type)] = t_id
                     disp_to_internal[(alt_id, 'All')] = t_id
                 internal_to_disp[t_id] = t_id
+
+        def get_task_info(t_id):
+            """内部ID・表示ID・エイリアスを考慮してTaskMasterから情報を確実に取得"""
+            if t_id in tasks_master:
+                return tasks_master[t_id]
+            # M_15 <-> 15M 相互変換による探索
+            m = re.match(r'^(\d+)([MC])$', t_id)
+            if m:
+                num, role = m.groups()
+                alt_id = f"{role}_{num}"
+                if alt_id in tasks_master:
+                    return tasks_master[alt_id]
+            m2 = re.match(r'^([MC])_(\d+)$', t_id)
+            if m2:
+                role, num = m2.groups()
+                alt_id = f"{num}{role}"
+                if alt_id in tasks_master:
+                    return tasks_master[alt_id]
+            return {}
 
         SPECIAL_DUTIES = (
             [f"A{i}" for i in range(1, 8)] +
@@ -174,7 +193,7 @@ if check_password():
             
             for d in days:
                 for t_id in all_tasks:
-                    t_info = tasks_master.get(t_id, {})
+                    t_info = get_task_info(t_id)
                     t_female_allowed = clean_str(t_info.get('FemaleAllowed', 'Y')).upper()
                     t_role = clean_str(t_info.get('Role', 'All')).upper()
                     
@@ -202,7 +221,7 @@ if check_password():
             for t_id in active_tasks_today:
                 if t_id == 'OFF':
                     continue
-                t_info = tasks_master.get(t_id, {})
+                t_info = get_task_info(t_id)
                 pair_raw = clean_str(t_info.get('PairTaskID', ''))
                 
                 if pair_raw and pair_raw not in ['nan', 'None', '']:
@@ -218,7 +237,7 @@ if check_password():
                             model.Add(x[p, d_curr, t_id] == x[p, d_next, resolved_pair_id])
 
         # -------------------------------------------------------------
-        # 目的関数 ＆ デバッグデータ収集
+        # 目的関数 ＆ デバッグデータ収集（TargetArea修正対応）
         # -------------------------------------------------------------
         penalty_terms = []
         score_debug_logs = []
@@ -230,7 +249,7 @@ if check_password():
                 if orig_int == 'OFF':
                     continue
                 
-                t_info = tasks_master.get(orig_int, {})
+                t_info = get_task_info(orig_int)
                 target_area = clean_str(t_info.get('TargetArea', '')).strip()
                 
                 score_debug_logs.append(
@@ -240,7 +259,7 @@ if check_password():
                 for t_id in all_tasks:
                     if t_id == 'OFF':
                         continue
-                    t_info_curr = tasks_master.get(t_id, {})
+                    t_info_curr = get_task_info(t_id)
                     t_target = clean_str(t_info_curr.get('TargetArea', '')).strip()
                     
                     if home_st and t_target:
@@ -326,7 +345,7 @@ if check_password():
                         for p_log in list(set(pair_debug_logs)):
                             st.write(p_log)
 
-                    with st.expander("🔍 初期シフトの拠点マッチング診断ログ（重要）"):
+                    with st.expander("🔍 初期シフトの拠点マッチング診断ログ"):
                         for s_log in score_debug_logs[:20]:
                             st.write(s_log)
 
