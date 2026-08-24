@@ -122,7 +122,6 @@ if check_password():
 
                     if pair_id and pair_id.isdigit():
                         prev_plain_id = f"{pair_id}{role_char}"
-                        # prev_plain_id (例: 39M) をやったら翌日は plain_id (例: 40M)
                         pair_rules[prev_plain_id] = plain_id
 
         # 特殊仕業ペアの登録（TaskID指定）
@@ -237,35 +236,37 @@ if check_password():
             for work_curr, work_next_required in pair_rules.items():
                 if work_curr in all_tasks and work_next_required in all_tasks:
                     for p in existing_members:
-                        # 当日 work_curr 割り当て ⇔ 翌日 work_next_required 割り当て
                         model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
+        # 7. 【絶対禁忌】他エリア仕業への新規割り当て禁止（ハード制約化）
+        # トレードによって「自エリア以外の仕業」が新たに割り当てられることを一切許可しない
+        for p in existing_members:
+            p_base_area = member_base_area.get(p, 'ANY')
+            if p_base_area != 'ANY':
+                for d in dates:
+                    orig_t = initial_assignment.get((p, d), 'OFF')
+                    for t in all_tasks:
+                        if is_fixed_task(t):
+                            continue
+                        t_area = get_task_area(t)
+                        # 変更先の仕業が自エリアと異なり、かつ初期シフトと違う場合は割り当て禁止(0)
+                        if t_area != 'ANY' and t_area != p_base_area and t != orig_t:
+                            model.Add(x[p, d, t] == 0)
+
         # -------------------------------------------------------------
-        # 目的関数: エリア最適化 ＋ 変更（トレード）最小化
+        # 目的関数: 変更（トレード）回数の最小化のみ
+        # （不適切な割り当てはすべてハード制約でブロック済）
         # -------------------------------------------------------------
         objective_terms = []
 
         for p in existing_members:
-            p_base_area = member_base_area.get(p, 'ANY')
             for d in dates:
                 orig_t = initial_assignment.get((p, d), 'OFF')
                 for t in all_tasks:
                     if is_fixed_task(t):
                         continue
-                    
-                    t_area = get_task_area(t)
-                    cost = 0
-
-                    # ① エリア不一致に対する巨大ペナルティ（1,000,000）
-                    if p_base_area != 'ANY' and t_area != 'ANY' and t_area != p_base_area:
-                        cost += 1000000
-
-                    # ② 初期シフトからの変更に対するコスト（1）
                     if t != orig_t:
-                        cost += 1
-
-                    if cost > 0:
-                        objective_terms.append(x[p, d, t] * cost)
+                        objective_terms.append(x[p, d, t] * 1)
 
         model.Minimize(sum(objective_terms))
 
@@ -303,7 +304,6 @@ if check_password():
 
             df_result = pd.DataFrame(result_rows)
 
-            # ペア制約の確認ログ生成
             for d_idx in range(len(dates) - 1):
                 d_curr = dates[d_idx]
                 d_next = dates[d_idx + 1]
