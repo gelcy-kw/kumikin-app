@@ -169,7 +169,7 @@ if check_password():
         
         existing_members = [m for m in members if m in df_initial_indexed.index]
         if len(existing_members) == 0:
-            return df_initial_raw, False, "メンバーIDが一致しませんでした", [], [], [], [], set(), "", {}
+            return df_initial_raw, False, "メンバーIDが一致しませんでした", [], [], [], [], set(), set(), "", {}
 
         initial_assignment = {}
         all_tasks_set = set()
@@ -308,6 +308,7 @@ if check_password():
         change_logs = []
         pair_applied_logs = []
         changed_cells = set()
+        overflow_cells = set()
 
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
             final_schedule = {}
@@ -342,10 +343,12 @@ if check_password():
                     task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                     row[d] = task_assigned
                     
+                    # 溢れ判定（LOCK日以外の、BaseAreaとTaskAreaが不一致な場合）
                     if not day_lock_flags.get(d, False):
                         t_area = get_task_area(task_assigned)
                         if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
                             overflow_count += 1
+                            overflow_cells.add((p, d))
 
                 row['OverFlow'] = overflow_count
                 result_rows.append(row)
@@ -364,9 +367,9 @@ if check_password():
                             f"【ペア整合確認】{p_name}さん({p}): {d_curr}『{work_curr}』 ➔ {d_next}『{work_next}』(完全連動)"
                         )
             
-            return df_result, True, "OK", change_logs, pair_applied_logs, [], [], changed_cells, id_col_name, day_lock_flags
+            return df_result, True, "OK", change_logs, pair_applied_logs, [], [], changed_cells, overflow_cells, id_col_name, day_lock_flags
         else:
-            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], [], [], [], set(), "", {}
+            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], [], [], [], set(), set(), "", {}
 
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
@@ -376,7 +379,7 @@ if check_password():
                 df_t = load_csv_safely(file_tasks)
                 df_i = load_csv_safely(file_initial)
                 
-                result_df, success, log_msg, change_logs, pair_debug_logs, _, _, changed_cells, id_col, day_lock_flags = run_optimization(df_m, df_t, df_i)
+                result_df, success, log_msg, change_logs, pair_debug_logs, _, _, changed_cells, overflow_cells, id_col, day_lock_flags = run_optimization(df_m, df_t, df_i)
                 
                 if success:
                     st.success("最適化計算が完了しました！")
@@ -394,8 +397,9 @@ if check_password():
                     st.subheader("📊 最適化結果プレビュー")
                     st.caption("※ **薄ピンク色の列**: LOCK（固定指定）された日")
                     st.caption("※ **黄緑色のセル**: トレードにより変更された勤務")
+                    st.caption("※ **黄色のセル**: 溢れ（自エリアと不一致）が発生している勤務")
 
-                    # スタイル適用関数（LOCK日のピンク色 ＆ 変更セルの黄緑色）
+                    # スタイル適用関数（LOCK日:ピンク / 変更:黄緑 / 溢れ:黄色）
                     def highlight_schedule(df):
                         style_df = pd.DataFrame('', index=df.index, columns=df.columns)
                         
@@ -405,11 +409,15 @@ if check_password():
                                 str_col = str(col)
                                 is_locked = day_lock_flags.get(str_col, False)
                                 is_changed = (p_id, str_col) in changed_cells
+                                is_overflow = (p_id, str_col) in overflow_cells
                                 
                                 # LOCK指定の日（列全体を薄ピンクに）
                                 if is_locked:
                                     style_df.loc[idx, col] = 'background-color: #f8d7da; color: #721c24;'
-                                # 変更されたセル（黄緑に）
+                                # 溢れセル（黄色に）
+                                elif is_overflow:
+                                    style_df.loc[idx, col] = 'background-color: #fff3cd; color: #856404; font-weight: bold;'
+                                # トレード変更セル（黄緑に）
                                 elif is_changed:
                                     style_df.loc[idx, col] = 'background-color: #d4edda; color: #155724; font-weight: bold;'
                                     
