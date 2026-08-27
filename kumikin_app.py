@@ -327,9 +327,13 @@ if check_password():
             result_rows = []
             
             if not daytype_row.empty:
-                result_rows.append(daytype_row.iloc[0].to_dict())
+                r_dict = daytype_row.iloc[0].to_dict()
+                r_dict['OverFlow'] = ''
+                result_rows.append(r_dict)
             if not lock_row.empty:
-                result_rows.append(lock_row.iloc[0].to_dict())
+                r_dict = lock_row.iloc[0].to_dict()
+                r_dict['OverFlow'] = ''
+                result_rows.append(r_dict)
 
             for p in existing_members:
                 p_base_area = member_base_area.get(p, 'ANY')
@@ -343,14 +347,15 @@ if check_password():
                     task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                     row[d] = task_assigned
                     
-                    # 溢れ判定（LOCK日以外の、BaseAreaとTaskAreaが不一致な場合）
+                    # 溢れ判定
                     if not day_lock_flags.get(d, False):
                         t_area = get_task_area(task_assigned)
                         if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
                             overflow_count += 1
                             overflow_cells.add((p, d))
 
-                row['OverFlow'] = overflow_count
+                # OverFlow値を明確に整数(int)として保持
+                row['OverFlow'] = int(overflow_count)
                 result_rows.append(row)
 
             df_result = pd.DataFrame(result_rows)
@@ -423,7 +428,10 @@ if check_password():
                                     
                         return style_df
 
-                    styled_df = result_df.style.apply(highlight_schedule, axis=None)
+                    # 表を表示用にフォーマット（OverFlowの空文字/整数整形）
+                    formatted_df = result_df.copy()
+                    styled_df = formatted_df.style.apply(highlight_schedule, axis=None)
+                    
                     st.dataframe(styled_df)
 
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
