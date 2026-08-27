@@ -402,12 +402,12 @@ if check_password():
                     st.caption("※ **薄ピンク色の列**: LOCK（固定指定）された日")
                     st.caption("※ **黄緑色のセル**: トレードにより変更された勤務")
                     st.caption("※ **黄色のセル**: 溢れ（自エリアと不一致）が発生している勤務")
-                    st.caption("※ **赤文字のセル**: 週休・休暇・公休などの休日セル")
+                    st.caption("※ **赤文字のセル**: 週休・休暇・公休などの休日セル（白背景＋赤文字）")
 
                     # 休日・休暇判定用キーワードリスト
                     OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF']
 
-                    # スタイル適用関数（優先順位: 休日赤字 > LOCK > 溢れ > トレード変更）
+                    # スタイル適用関数（背景色：白背景＋赤太字）
                     def highlight_schedule(df):
                         style_df = pd.DataFrame('', index=df.index, columns=df.columns)
                         
@@ -423,9 +423,11 @@ if check_password():
                                 # 休日・休暇系の文字が含まれているか判定
                                 is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
 
-                                # 1. 週休・休暇などは赤文字（薄い赤背景＋赤太字）
+                                # 1. 週休・休暇などは白背景＋赤文字太字
                                 if is_off:
-                                    style_df.loc[idx, col] = 'background-color: #f8d7da; color: #dc3545; font-weight: bold;'
+                                    # LOCK列の中にある場合でも背景はLOCK色を保ちつつ赤文字にするか、白背景＋赤文字にするか
+                                    bg_color = '#f8d7da' if is_locked else '#ffffff'
+                                    style_df.loc[idx, col] = f'background-color: {bg_color}; color: #d9534f; font-weight: bold;'
                                 # 2. LOCK指定の日（列全体を薄ピンクに）
                                 elif is_locked:
                                     style_df.loc[idx, col] = 'background-color: #f8d7da; color: #721c24;'
