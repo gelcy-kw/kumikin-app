@@ -354,7 +354,6 @@ if check_password():
                             overflow_count += 1
                             overflow_cells.add((p, d))
 
-                # OverFlow値を明確に整数(int)として保持
                 row['OverFlow'] = int(overflow_count)
                 result_rows.append(row)
 
@@ -403,35 +402,43 @@ if check_password():
                     st.caption("※ **薄ピンク色の列**: LOCK（固定指定）された日")
                     st.caption("※ **黄緑色のセル**: トレードにより変更された勤務")
                     st.caption("※ **黄色のセル**: 溢れ（自エリアと不一致）が発生している勤務")
+                    st.caption("※ **赤文字のセル**: 週休・休暇・公休などの休日セル")
 
-                    # スタイル適用関数（LOCK日:ピンク / 変更:黄緑 / 溢れ:黄色）
+                    # 休日・休暇判定用キーワードリスト
+                    OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF']
+
+                    # スタイル適用関数（優先順位: 休日赤字 > LOCK > 溢れ > トレード変更）
                     def highlight_schedule(df):
                         style_df = pd.DataFrame('', index=df.index, columns=df.columns)
                         
                         for idx, row in df.iterrows():
                             p_id = str(row[id_col])
                             for col in df.columns:
+                                cell_val = str(row[col])
                                 str_col = str(col)
                                 is_locked = day_lock_flags.get(str_col, False)
                                 is_changed = (p_id, str_col) in changed_cells
                                 is_overflow = (p_id, str_col) in overflow_cells
                                 
-                                # LOCK指定の日（列全体を薄ピンクに）
-                                if is_locked:
+                                # 休日・休暇系の文字が含まれているか判定
+                                is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
+
+                                # 1. 週休・休暇などは赤文字（薄い赤背景＋赤太字）
+                                if is_off:
+                                    style_df.loc[idx, col] = 'background-color: #f8d7da; color: #dc3545; font-weight: bold;'
+                                # 2. LOCK指定の日（列全体を薄ピンクに）
+                                elif is_locked:
                                     style_df.loc[idx, col] = 'background-color: #f8d7da; color: #721c24;'
-                                # 溢れセル（黄色に）
+                                # 3. 溢れセル（黄色に）
                                 elif is_overflow:
                                     style_df.loc[idx, col] = 'background-color: #fff3cd; color: #856404; font-weight: bold;'
-                                # トレード変更セル（黄緑に）
+                                # 4. トレード変更セル（黄緑に）
                                 elif is_changed:
                                     style_df.loc[idx, col] = 'background-color: #d4edda; color: #155724; font-weight: bold;'
                                     
                         return style_df
 
-                    # 表を表示用にフォーマット（OverFlowの空文字/整数整形）
-                    formatted_df = result_df.copy()
-                    styled_df = formatted_df.style.apply(highlight_schedule, axis=None)
-                    
+                    styled_df = result_df.style.apply(highlight_schedule, axis=None)
                     st.dataframe(styled_df)
 
                     csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
