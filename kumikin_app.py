@@ -35,7 +35,6 @@ def clean_str(val):
         return ""
     return str(val).strip().upper()
 
-# 【修正】特定の地域名に依存せず、大文字化・余白除去のみを行う汎用ノーマライズ関数
 def normalize_area_dynamic(val):
     s = clean_str(val)
     return s if s else 'ANY'
@@ -69,7 +68,6 @@ if check_password():
         
         for _, row in df_members.iterrows():
             m_id = clean_str(row['MemberID'])
-            # CSVの BaseArea 列の値を動的にノーマライズして取得
             area = normalize_area_dynamic(row.get('BaseArea', ''))
             role = clean_str(row.get('Role', ''))
             gender = clean_str(row.get('Gender', ''))
@@ -88,7 +86,6 @@ if check_password():
         if 'TaskID' in df_tasks.columns:
             for _, row in df_tasks.iterrows():
                 t_id = clean_str(row['TaskID'])
-                # CSVの TargetArea 列の値を動的にノーマライズして取得
                 t_area = normalize_area_dynamic(row.get('TargetArea', ''))
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
                 pair_id = clean_str(row.get('PairTaskID', ''))
@@ -243,7 +240,6 @@ if check_password():
                         if is_fixed_task(t) or t == orig_t:
                             continue
                         t_area = get_task_area(t)
-                        # 変更先の仕業エリアが他エリアの場合、トレード不可
                         if t_area != 'ANY' and t_area != p_base_area:
                             model.Add(x[p, d, t] == 0)
 
@@ -262,11 +258,9 @@ if check_password():
                     
                     t_area = get_task_area(t)
                     
-                    # 自エリアと一致する仕業になれば大きく加点（-10000）
                     if p_base_area != 'ANY' and t_area == p_base_area:
                         objective_terms.append(x[p, d, t] * -10000)
                     
-                    # 変更（トレード）が発生したら小さなペナルティ（+1）
                     if t != orig_t:
                         objective_terms.append(x[p, d, t] * 1)
 
@@ -294,14 +288,27 @@ if check_password():
                                 changed_cells.add((p, d))
                             break
 
+            # 結果データフレームの作成と OverFlow カウント計算
             result_rows = []
             for p in existing_members:
+                p_base_area = member_base_area.get(p, 'ANY')
+                overflow_count = 0
+                
                 row = {
                     id_col_name: p,
                     name_col_name: member_names.get(p, '')
                 }
                 for d in dates:
-                    row[d] = final_schedule.get((p, d), 'OFF')
+                    task_assigned = final_schedule.get((p, d), 'OFF')
+                    row[d] = task_assigned
+                    
+                    # 溢れ判定（BaseAreaとTaskAreaが不一致、かつ両方ANYでない場合）
+                    t_area = get_task_area(task_assigned)
+                    if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
+                        overflow_count += 1
+
+                # 最終列に OverFlow を追加
+                row['OverFlow'] = overflow_count
                 result_rows.append(row)
 
             df_result = pd.DataFrame(result_rows)
