@@ -35,15 +35,10 @@ def clean_str(val):
         return ""
     return str(val).strip().upper()
 
-def normalize_area(area_str):
-    a = clean_str(area_str)
-    if 'AKAIKE' in a or '赤池' in a:
-        return 'AKAIKE'
-    if 'JOSHIN' in a or '上小田井' in a or 'JOSIN' in a:
-        return 'JOSHIN'
-    if 'MEIKO' in a or '名港' in a:
-        return 'MEIKO'
-    return a if a else 'ANY'
+# 【修正】特定の地域名に依存せず、大文字化・余白除去のみを行う汎用ノーマライズ関数
+def normalize_area_dynamic(val):
+    s = clean_str(val)
+    return s if s else 'ANY'
 
 def is_fixed_task(task_code):
     if not task_code or task_code == 'OFF':
@@ -66,7 +61,7 @@ if check_password():
         name_col_name = df_initial_raw.columns[1]
         dates = [clean_str(c) for c in df_initial_raw.columns[2:]]
 
-        # 1. メンバーマスターのパース
+        # 1. メンバーマスターの動的パース
         df_members['MemberID'] = df_members['MemberID'].apply(clean_str)
         member_base_area = {}
         member_role = {}
@@ -74,7 +69,8 @@ if check_password():
         
         for _, row in df_members.iterrows():
             m_id = clean_str(row['MemberID'])
-            area = normalize_area(row.get('BaseArea', ''))
+            # CSVの BaseArea 列の値を動的にノーマライズして取得
+            area = normalize_area_dynamic(row.get('BaseArea', ''))
             role = clean_str(row.get('Role', ''))
             gender = clean_str(row.get('Gender', ''))
             
@@ -84,7 +80,7 @@ if check_password():
 
         members = list(member_base_area.keys())
 
-        # 2. 仕業マスターのパース
+        # 2. 仕業マスターの動的パース
         task_area_map = {}
         task_female_allowed_map = {}
         pair_rules = {}
@@ -92,7 +88,8 @@ if check_password():
         if 'TaskID' in df_tasks.columns:
             for _, row in df_tasks.iterrows():
                 t_id = clean_str(row['TaskID'])
-                t_area = normalize_area(row.get('TargetArea', ''))
+                # CSVの TargetArea 列の値を動的にノーマライズして取得
+                t_area = normalize_area_dynamic(row.get('TargetArea', ''))
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
                 pair_id = clean_str(row.get('PairTaskID', ''))
 
@@ -236,8 +233,7 @@ if check_password():
                     for p in existing_members:
                         model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
-        # 7. 【絶対禁忌ルール】他エリア仕業への新規割り当て禁止
-        # 変更先の仕業 `t` が自エリア以外（かつANY以外）である場合、その変更（orig_t != t）を禁止する
+        # 7. 【絶対禁忌ルール】他エリア仕業への新規割り当て禁止（動的エリア判定）
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
             if p_base_area != 'ANY':
