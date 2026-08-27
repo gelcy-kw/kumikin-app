@@ -33,7 +33,8 @@ def load_csv_safely(uploaded_file):
 def clean_str(val):
     if pd.isna(val):
         return ""
-    return str(val).strip().upper()
+    s = str(val).strip()
+    return s[:-2].upper() if s.endswith('.0') else s.upper()
 
 def normalize_area_dynamic(val):
     s = clean_str(val)
@@ -62,7 +63,26 @@ if check_password():
         name_col_name = df_initial_raw.columns[1]
         dates = [clean_str(c) for c in df_initial_raw.columns[2:]]
 
-        # 1. メンバーマスターの動的パース
+        # -------------------------------------------------------------
+        # 1. 制御行（LOCK行）および DAYTYPE行 の判定
+        # -------------------------------------------------------------
+        # LOCK行の検出（大文字小文字問わず 'LOCK' を含むID行）
+        lock_row = df_initial_raw[df_initial_raw[id_col_name].apply(clean_str) == 'LOCK']
+        day_lock_flags = {}
+        for d in dates:
+            if not lock_row.empty:
+                val = clean_str(lock_row.iloc[0][d])
+                # 'LOCK', '1', 'YES', 'TRUE' などが書かれていればロック対象
+                day_lock_flags[d] = val in ['LOCK', '1', 'YES', 'TRUE', '固定']
+            else:
+                day_lock_flags[d] = False
+
+        # DAYTYPE行の取得（参考情報・将来の拡張用）
+        daytype_row = df_initial_raw[df_initial_raw[id_col_name].apply(clean_str) == 'DAYTYPE']
+
+        # -------------------------------------------------------------
+        # 2. メンバーマスターの動的パース
+        # -------------------------------------------------------------
         df_members['MemberID'] = df_members['MemberID'].apply(clean_str)
         member_base_area = {}
         member_role = {}
@@ -80,7 +100,9 @@ if check_password():
 
         members = list(member_base_area.keys())
 
-        # 2. 仕業マスターの動的パース
+        # -------------------------------------------------------------
+        # 3. 仕業マスターの動的パース
+        # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
         pair_rules = {}
@@ -135,8 +157,11 @@ if check_password():
         def is_female_allowed(task_code):
             return task_female_allowed_map.get(task_code, 'Y') != 'N'
 
-        # 3. 初期勤務表データの整理
-        df_sched = df_initial_raw[df_initial_raw[id_col_name].apply(clean_str) != 'DAYTYPE'].copy()
+        # -------------------------------------------------------------
+        # 4. 初期勤務表データの整理（制御行・特殊行を除外）
+        # -------------------------------------------------------------
+        ignored_rows = ['DAYTYPE', 'LOCK']
+        df_sched = df_initial_raw[~df_initial_raw[id_col_name].apply(clean_str).isin(ignored_rows)].copy()
         df_sched[id_col_name] = df_sched[id_col_name].apply(clean_str)
 
         member_names = {}
@@ -156,7 +181,6 @@ if check_password():
 
         for p in existing_members:
             for d in dates:
-                # 入力された文字（「公休」「休暇」など）をそのまま尊重して取得
                 val = str(df_initial_indexed.loc[p, d]).strip() if pd.notna(df_initial_indexed.loc[p, d]) else '公休'
                 if not val:
                     val = '公休'
@@ -165,6 +189,9 @@ if check_password():
 
         all_tasks = list(all_tasks_set)
 
+        # -------------------------------------------------------------
+        # 5. OR-Tools モデル構築
+        # -------------------------------------------------------------
         model = cp_model.CpModel()
         x = {}
         for p in existing_members:
@@ -181,20 +208,24 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 2. 公休・休暇・特殊仕業の固定
+        # 2. OFF・公休・休暇等の固定 ＆ ★LOCK日の全員固定★
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), '公休')
-                if is_fixed_task(orig_t):
+                
+                # 休みの固定 OR LOCK指定日の固定
+                if is_fixed_task(orig_t) or day_lock_flags.get(d, False):
                     for t in all_tasks:
                         if t != orig_t:
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, orig_t] == 1)
 
-        # 3. 役職マッチング
+        # 3. 役職マッチング（LOCK日は上記で固定済みのため実質スキップ）
         for p in existing_members:
             p_role = member_role.get(p, '')
             for d in dates:
+                if day_lock_flags.get(d, False):
+                    continue
                 for t in all_tasks:
                     if is_fixed_task(t):
                         continue
@@ -208,6 +239,8 @@ if check_password():
             p_gender = member_gender.get(p, '')
             if p_gender == 'F':
                 for d in dates:
+                    if day_lock_flags.get(d, False):
+                        continue
                     for t in all_tasks:
                         if is_fixed_task(t):
                             continue
@@ -216,6 +249,8 @@ if check_password():
 
         # 5. 各日の仕業人数の維持
         for d in dates:
+            if day_lock_flags.get(d, False):
+                continue
             tasks_today = [initial_assignment.get((p, d), '公休') for p in existing_members]
             for t in all_tasks:
                 if is_fixed_task(t):
@@ -233,11 +268,13 @@ if check_password():
                     for p in existing_members:
                         model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
-        # 7. 【絶対禁忌ルール】他エリア仕業への新規割り当て禁止（動的エリア判定）
+        # 7. 他エリア仕業への新規割り当て禁止
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
             if p_base_area != 'ANY':
                 for d in dates:
+                    if day_lock_flags.get(d, False):
+                        continue
                     orig_t = initial_assignment.get((p, d), '公休')
                     for t in all_tasks:
                         if is_fixed_task(t) or t == orig_t:
@@ -254,6 +291,10 @@ if check_password():
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
             for d in dates:
+                # LOCK指定のある日は、変更評価やOverFlowペナルティ計算から完全にスキップ
+                if day_lock_flags.get(d, False):
+                    continue
+
                 orig_t = initial_assignment.get((p, d), '公休')
                 for t in all_tasks:
                     if is_fixed_task(t):
@@ -261,14 +302,19 @@ if check_password():
                     
                     t_area = get_task_area(t)
                     
+                    # 自エリアと一致している場合は大きなご褒美
                     if p_base_area != 'ANY' and t_area == p_base_area:
                         objective_terms.append(x[p, d, t] * -10000)
                     
+                    # 初期シフトから変更があった場合の小さなペナルティ
                     if t != orig_t:
                         objective_terms.append(x[p, d, t] * 1)
 
         model.Minimize(sum(objective_terms))
 
+        # -------------------------------------------------------------
+        # ソルバー実行
+        # -------------------------------------------------------------
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 60.0
         status = solver.Solve(model)
@@ -293,6 +339,13 @@ if check_password():
 
             # 結果データフレームの作成と OverFlow カウント計算
             result_rows = []
+            
+            # 元の DAYTYPE 行と LOCK 行を保持して出力
+            if not daytype_row.empty:
+                result_rows.append(daytype_row.iloc[0].to_dict())
+            if not lock_row.empty:
+                result_rows.append(lock_row.iloc[0].to_dict())
+
             for p in existing_members:
                 p_base_area = member_base_area.get(p, 'ANY')
                 overflow_count = 0
@@ -305,10 +358,11 @@ if check_password():
                     task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                     row[d] = task_assigned
                     
-                    # 溢れ判定（BaseAreaとTaskAreaが不一致、かつ両方ANYでない場合）
-                    t_area = get_task_area(task_assigned)
-                    if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
-                        overflow_count += 1
+                    # 溢れ判定（LOCK日以外の、BaseAreaとTaskAreaが不一致な場合）
+                    if not day_lock_flags.get(d, False):
+                        t_area = get_task_area(task_assigned)
+                        if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
+                            overflow_count += 1
 
                 # 最終列に OverFlow を追加
                 row['OverFlow'] = overflow_count
