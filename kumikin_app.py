@@ -39,7 +39,7 @@ def normalize_area_dynamic(val):
     s = clean_str(val)
     return s if s else 'ANY'
 
-# 【修正】数字から始まらない文字（OFF, 公, 暇, 日勤など）はすべて固定勤務（トレード不可）とみなす
+# 数字から始まらない文字（OFF, 公休, 休暇, 日勤など）はすべて固定勤務（トレード不可）とみなす
 def is_fixed_task(task_code):
     if not task_code:
         return True
@@ -156,9 +156,10 @@ if check_password():
 
         for p in existing_members:
             for d in dates:
-                val = str(df_initial_indexed.loc[p, d]).strip() if pd.notna(df_initial_indexed.loc[p, d]) else '公'
+                # 入力された文字（「公休」「休暇」など）をそのまま尊重して取得
+                val = str(df_initial_indexed.loc[p, d]).strip() if pd.notna(df_initial_indexed.loc[p, d]) else '公休'
                 if not val:
-                    val = '公'
+                    val = '公休'
                 initial_assignment[(p, d)] = val
                 all_tasks_set.add(val)
 
@@ -180,10 +181,10 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 2. OFF・公・暇・特殊仕業の固定
+        # 2. 公休・休暇・特殊仕業の固定
         for p in existing_members:
             for d in dates:
-                orig_t = initial_assignment.get((p, d), '公')
+                orig_t = initial_assignment.get((p, d), '公休')
                 if is_fixed_task(orig_t):
                     for t in all_tasks:
                         if t != orig_t:
@@ -215,7 +216,7 @@ if check_password():
 
         # 5. 各日の仕業人数の維持
         for d in dates:
-            tasks_today = [initial_assignment.get((p, d), '公') for p in existing_members]
+            tasks_today = [initial_assignment.get((p, d), '公休') for p in existing_members]
             for t in all_tasks:
                 if is_fixed_task(t):
                     continue
@@ -237,7 +238,7 @@ if check_password():
             p_base_area = member_base_area.get(p, 'ANY')
             if p_base_area != 'ANY':
                 for d in dates:
-                    orig_t = initial_assignment.get((p, d), '公')
+                    orig_t = initial_assignment.get((p, d), '公休')
                     for t in all_tasks:
                         if is_fixed_task(t) or t == orig_t:
                             continue
@@ -253,7 +254,7 @@ if check_password():
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
             for d in dates:
-                orig_t = initial_assignment.get((p, d), '公')
+                orig_t = initial_assignment.get((p, d), '公休')
                 for t in all_tasks:
                     if is_fixed_task(t):
                         continue
@@ -283,7 +284,7 @@ if check_password():
                     for t in all_tasks:
                         if solver.Value(x[p, d, t]) == 1:
                             final_schedule[(p, d)] = t
-                            orig_t = initial_assignment.get((p, d), '公')
+                            orig_t = initial_assignment.get((p, d), '公休')
                             if t != orig_t:
                                 p_name = member_names.get(p, p)
                                 change_logs.append(f"【{d}】{p_name}さん({p}) : {orig_t} ➔ {t}")
@@ -301,7 +302,7 @@ if check_password():
                     name_col_name: member_names.get(p, '')
                 }
                 for d in dates:
-                    task_assigned = final_schedule.get((p, d), '公')
+                    task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                     row[d] = task_assigned
                     
                     # 溢れ判定（BaseAreaとTaskAreaが不一致、かつ両方ANYでない場合）
@@ -319,7 +320,7 @@ if check_password():
                 d_curr = dates[d_idx]
                 d_next = dates[d_idx + 1]
                 for p in existing_members:
-                    work_curr = final_schedule.get((p, d_curr), '公')
+                    work_curr = final_schedule.get((p, d_curr), '公休')
                     if work_curr in pair_rules:
                         work_next = pair_rules[work_curr]
                         p_name = member_names.get(p, p)
