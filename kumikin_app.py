@@ -127,6 +127,8 @@ if check_password():
             task_area_map = {}
             task_female_allowed_map = {}
             task_trade_allowed_map = {}
+            task_start_type_map = {}
+            task_end_type_map = {}
             pair_rules = {}
 
             if 'TaskID' in df_tasks.columns:
@@ -134,6 +136,8 @@ if check_password():
                     t_id = clean_str(row['TaskID'])
                     t_area = normalize_area_dynamic(row.get('TargetArea', ''))
                     f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
+                    start_t = clean_str(row.get('StartType', ''))
+                    end_t = clean_str(row.get('EndType', ''))
                     
                     if 'TradeAllowed' in df_tasks.columns:
                         trade_allowed = parse_trade_allowed(row.get('TradeAllowed'))
@@ -145,6 +149,8 @@ if check_password():
                     task_area_map[t_id] = t_area
                     task_female_allowed_map[t_id] = f_allowed
                     task_trade_allowed_map[t_id] = trade_allowed
+                    task_start_type_map[t_id] = start_t
+                    task_end_type_map[t_id] = end_t
 
                     m_match = re.match(r'^(\d+)([MC])$', t_id)
                     if m_match:
@@ -164,6 +170,8 @@ if check_password():
                         task_area_map[plain_id] = t_area
                         task_female_allowed_map[plain_id] = f_allowed
                         task_trade_allowed_map[plain_id] = trade_allowed
+                        task_start_type_map[plain_id] = start_t
+                        task_end_type_map[plain_id] = end_t
 
                         if pair_id and pair_id.isdigit():
                             prev_plain_id = f"{pair_id}{role_char}"
@@ -193,6 +201,12 @@ if check_password():
                         return False
                     return True
                 return task_trade_allowed_map.get(task_code, 'Y') == 'Y'
+
+            def get_start_type(task_code):
+                return task_start_type_map.get(task_code, '')
+
+            def get_end_type(task_code):
+                return task_end_type_map.get(task_code, '')
 
             ignored_rows = ['DAYTYPE', 'LOCK']
             df_sched = df_initial_raw[~df_initial_raw[id_col_name].apply(clean_str).isin(ignored_rows)].copy()
@@ -386,6 +400,27 @@ if check_password():
             
             objective_terms.append(max_overflow_var * 5000)
 
+            # ---【追加】遅退勤 (LATE) → 早出勤 (EARLY) に対するペナルティ（ソフト制約） ---
+            LATE_PATTERNS = ['LATE', '遅', '夜', 'NIGHT', 'L']
+            EARLY_PATTERNS = ['EARLY', '早', '朝', 'MORNING', 'E']
+
+            for d_idx in range(len(dates) - 1):
+                d_curr = dates[d_idx]
+                d_next = dates[d_idx + 1]
+
+                for p in existing_members:
+                    for t_curr in all_tasks:
+                        end_t = get_end_type(t_curr)
+                        if any(lp in end_t for lp in LATE_PATTERNS):
+                            for t_next in all_tasks:
+                                start_t = get_start_type(t_next)
+                                if any(ep in start_t for ep in EARLY_PATTERNS):
+                                    # 前日t_currかつ翌日t_nextが両方1の時に1となる変数を作成
+                                    late_early_var = model.NewBoolVar(f'late_early_{p}_{d_curr}')
+                                    model.AddMinEquality(late_early_var, [x[p, d_curr, t_curr], x[p, d_next, t_next]])
+                                    # 控えめなペナルティ（50）を付加
+                                    objective_terms.append(late_early_var * 50)
+
             for p in existing_members:
                 for d in dates:
                     if day_lock_flags.get(d, False):
@@ -479,7 +514,6 @@ if check_password():
 
                 df_result = pd.DataFrame(result_rows)
 
-                # OF_M1, OF_M2 列を整数表記に明示的に変換する
                 for m_col in [col_m1, col_m2]:
                     if m_col and m_col in df_result.columns:
                         df_result[m_col] = df_result[m_col].apply(
@@ -574,7 +608,6 @@ if check_password():
                     styled_df = result_df.style.apply(highlight_schedule, axis=None)
                     st.dataframe(styled_df)
 
-                    # --- 色付きHTML (PDF印刷用) の生成処理 ---
                     def generate_styled_html(df, id_col_name, day_lock_flags, changed_cells, overflow_cells):
                         html = """
                         <html>
