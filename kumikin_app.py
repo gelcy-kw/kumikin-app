@@ -186,6 +186,10 @@ if check_password():
 
             log(f"構築されたペア制約数: {len(pair_rules)}件")
 
+            # --- 🔥 ペアの1日目（前半）と2日目（後半）を判定するセット ---
+            first_day_pair_tasks = set(pair_rules.keys())
+            second_day_pair_tasks = set(pair_rules.values())
+
             def get_task_area(task_code):
                 if is_off_or_vacation(task_code):
                     return 'ANY'
@@ -260,10 +264,25 @@ if check_password():
                 for p in existing_members:
                     model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
+            # --- 🔥 月初日（第1列）と月末日（最終列）の自動判定 ---
+            first_date = dates[0] if dates else None
+            last_date = dates[-1] if dates else None
+
             for p in existing_members:
                 for d in dates:
                     orig_t = initial_assignment.get((p, d), '公休')
-                    if not is_trade_allowed(orig_t) or day_lock_flags.get(d, False):
+                    
+                    # 🔥 月末日の泊まり1日目（翌月連動なし）の判定
+                    is_last_day_pair_first = (d == last_date and orig_t in first_day_pair_tasks)
+                    # 🔥 月初日の泊まり2日目（前月連動なし）の判定
+                    is_first_day_pair_second = (d == first_date and orig_t in second_day_pair_tasks)
+
+                    if not is_trade_allowed(orig_t) or day_lock_flags.get(d, False) or is_last_day_pair_first or is_first_day_pair_second:
+                        if is_last_day_pair_first:
+                            log(f"🔒【月末保留保護】{d} の {p}さん({member_names.get(p, p)}) の『{orig_t}』は翌月連動なしのため固定化されました。")
+                        elif is_first_day_pair_second:
+                            log(f"🔒【月初保留保護】{d} の {p}さん({member_names.get(p, p)}) の『{orig_t}』は前月連動なしのため固定化されました。")
+                            
                         for t in all_tasks:
                             if t != orig_t:
                                 model.Add(x[p, d, t] == 0)
@@ -316,14 +335,20 @@ if check_password():
                         orig1 = initial_assignment.get((p1, d), '公休')
                         orig2 = initial_assignment.get((p2, d), '公休')
                         
-                        if orig1 != orig2 and is_trade_allowed(orig1) and is_trade_allowed(orig2):
+                        # 月初・月末の境界ペア保護判定
+                        p1_boundary_pair = (d == last_date and orig1 in first_day_pair_tasks) or (d == first_date and orig1 in second_day_pair_tasks)
+                        p2_boundary_pair = (d == last_date and orig2 in first_day_pair_tasks) or (d == first_date and orig2 in second_day_pair_tasks)
+
+                        if orig1 != orig2 and is_trade_allowed(orig1) and is_trade_allowed(orig2) and not p1_boundary_pair and not p2_boundary_pair:
                             s_var = model.NewBoolVar(f'pair_swap_{p1}_{p2}_{d}')
                             model.AddMinEquality(s_var, [x[p1, d, orig2], x[p2, d, orig1]])
                             pair_swaps[(p1, p2)] = s_var
 
                 for p in existing_members:
                     orig_t = initial_assignment.get((p, d), '公休')
-                    if not is_trade_allowed(orig_t):
+                    is_boundary_pair = (d == last_date and orig_t in first_day_pair_tasks) or (d == first_date and orig_t in second_day_pair_tasks)
+
+                    if not is_trade_allowed(orig_t) or is_boundary_pair:
                         continue
                     
                     p_swaps = []
