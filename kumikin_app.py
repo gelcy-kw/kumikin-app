@@ -400,7 +400,7 @@ if check_password():
             
             objective_terms.append(max_overflow_var * 5000)
 
-            # ---【追加】遅退勤 (LATE) → 早出勤 (EARLY) に対するペナルティ（ソフト制約） ---
+            # 遅退勤 (LATE) → 早出勤 (EARLY) ペナルティ
             LATE_PATTERNS = ['LATE', '遅', '夜', 'NIGHT', 'L']
             EARLY_PATTERNS = ['EARLY', '早', '朝', 'MORNING', 'E']
 
@@ -415,10 +415,8 @@ if check_password():
                             for t_next in all_tasks:
                                 start_t = get_start_type(t_next)
                                 if any(ep in start_t for ep in EARLY_PATTERNS):
-                                    # 前日t_currかつ翌日t_nextが両方1の時に1となる変数を作成
                                     late_early_var = model.NewBoolVar(f'late_early_{p}_{d_curr}')
                                     model.AddMinEquality(late_early_var, [x[p, d_curr, t_curr], x[p, d_next, t_next]])
-                                    # 控えめなペナルティ（50）を付加
                                     objective_terms.append(late_early_var * 50)
 
             for p in existing_members:
@@ -579,35 +577,58 @@ if check_password():
 
                     OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
 
-                    def highlight_schedule(df):
-                        style_df = pd.DataFrame('', index=df.index, columns=df.columns)
-                        
+                    # HTMLテーブルとして安全に描画する関数（st.dataframeのDOMクラッシュを回避）
+                    def render_custom_html_table(df, id_col_name, day_lock_flags, changed_cells, overflow_cells):
+                        html = """
+                        <div style="overflow-x: auto; max-height: 500px; border: 1px solid #e6e6e6; border-radius: 5px; margin-bottom: 20px;">
+                        <table style="border-collapse: collapse; width: 100%; font-size: 12px; text-align: center;">
+                            <thead>
+                                <tr style="background-color: #f8f9fa; position: sticky; top: 0; z-index: 10;">
+                        """
+                        for col in df.columns:
+                            html += f'<th style="border: 1px solid #dee2e6; padding: 8px; white-space: nowrap;">{col}</th>'
+                        html += "</tr></thead><tbody>"
+
                         for idx, row in df.iterrows():
-                            p_id = str(row[id_col])
+                            p_id = str(row[id_col_name])
+                            html += "<tr>"
                             for col in df.columns:
                                 cell_val = str(row[col])
                                 str_col = str(col)
                                 is_locked = day_lock_flags.get(str_col, False)
                                 is_changed = (p_id, str_col) in changed_cells
                                 is_overflow = (p_id, str_col) in overflow_cells
-                                
                                 is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
 
+                                bg = "#ffffff"
+                                color = "#212529"
+                                weight = "normal"
+
                                 if is_off:
-                                    bg_color = '#f8d7da' if is_locked else '#ffffff'
-                                    style_df.loc[idx, col] = f'background-color: {bg_color}; color: #d9534f; font-weight: bold;'
+                                    bg = "#f8d7da" if is_locked else "#ffffff"
+                                    color = "#d9534f"
+                                    weight = "bold"
                                 elif is_locked:
-                                    style_df.loc[idx, col] = 'background-color: #f8d7da; color: #721c24;'
+                                    bg = "#f8d7da"
+                                    color = "#721c24"
                                 elif is_overflow:
-                                    style_df.loc[idx, col] = 'background-color: #fff3cd; color: #856404; font-weight: bold;'
+                                    bg = "#fff3cd"
+                                    color = "#856404"
+                                    weight = "bold"
                                 elif is_changed:
-                                    style_df.loc[idx, col] = 'background-color: #d4edda; color: #155724; font-weight: bold;'
-                                    
-                        return style_df
+                                    bg = "#d4edda"
+                                    color = "#155724"
+                                    weight = "bold"
 
-                    styled_df = result_df.style.apply(highlight_schedule, axis=None)
-                    st.dataframe(styled_df)
+                                html += f'<td style="background-color: {bg}; color: {color}; font-weight: {weight}; border: 1px solid #dee2e6; padding: 6px; white-space: nowrap;">{cell_val}</td>'
+                            html += "</tr>"
+                        html += "</tbody></table></div>"
+                        return html
 
+                    # 安定したHTML表示を使用
+                    st.markdown(render_custom_html_table(result_df, id_col, day_lock_flags, changed_cells, overflow_cells), unsafe_allow_html=True)
+
+                    # ダウンロード用のHTML出力生成
                     def generate_styled_html(df, id_col_name, day_lock_flags, changed_cells, overflow_cells):
                         html = """
                         <html>
@@ -667,27 +688,24 @@ if check_password():
                         html += "</tbody></table></body></html>"
                         return html
 
-                    col_dl1, col_dl2 = st.columns(2)
+                    csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
+                    html_data = generate_styled_html(result_df, id_col, day_lock_flags, changed_cells, overflow_cells)
 
-                    with col_dl1:
-                        csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button(
-                            label="📥 CSVファイルをダウンロード",
-                            data=csv_data,
-                            file_name="Optimized_Schedule.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
+                    st.download_button(
+                        label="📥 CSVファイルをダウンロード",
+                        data=csv_data,
+                        file_name="Optimized_Schedule.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
 
-                    with col_dl2:
-                        html_data = generate_styled_html(result_df, id_col, day_lock_flags, changed_cells, overflow_cells)
-                        st.download_button(
-                            label="📄 色付きHTML（PDF保存用）をダウンロード",
-                            data=html_data.encode('utf-8-sig'),
-                            file_name="Optimized_Schedule.html",
-                            mime="text/html",
-                            use_container_width=True
-                        )
+                    st.download_button(
+                        label="📄 色付きHTML（PDF保存用）をダウンロード",
+                        data=html_data.encode('utf-8-sig'),
+                        file_name="Optimized_Schedule.html",
+                        mime="text/html",
+                        use_container_width=True
+                    )
 
                 else:
                     st.error(f"解が見つからなかったか、エラーが発生しました。（詳細: {log_msg}）")
