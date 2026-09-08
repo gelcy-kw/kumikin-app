@@ -65,6 +65,93 @@ def is_off_or_vacation(task_code):
     OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
     return any(kw in task_code for kw in OFF_KEYWORDS)
 
+OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
+
+# HTMLテーブル生成用関数（プレビュー・モーダル・ファイル保存で共通利用）
+def render_custom_html_table(df, id_col_name, day_lock_flags, changed_cells, overflow_cells, max_height="500px"):
+    html = f"""
+    <div style="overflow-x: auto; max-height: {max_height}; border: 1px solid #dee2e6; border-radius: 6px; margin-bottom: 15px;">
+    <table style="border-collapse: collapse; width: 100%; font-size: 12px; text-align: center; font-family: sans-serif;">
+        <thead><tr style="background-color: #f8f9fa; position: sticky; top: 0; z-index: 10; box-shadow: 0 1px 2px rgba(0,0,0,0.1);">
+    """
+    for col in df.columns:
+        html += f'<th style="border: 1px solid #dee2e6; padding: 8px 10px; white-space: nowrap; color: #495057; font-weight: 600;">{col}</th>'
+    html += "</tr></thead><tbody>"
+
+    for idx, row in df.iterrows():
+        p_id = str(row[id_col_name])
+        html += "<tr>"
+        for col in df.columns:
+            cell_val = str(row[col])
+            str_col = str(col)
+            is_locked = day_lock_flags.get(str_col, False)
+            is_changed = (p_id, str_col) in changed_cells
+            is_overflow = (p_id, str_col) in overflow_cells
+            is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
+
+            bg = "#ffffff"
+            color = "#212529"
+            weight = "normal"
+
+            if is_off:
+                bg = "#f8d7da" if is_locked else "#ffffff"
+                color = "#d9534f"
+                weight = "bold"
+            elif is_locked:
+                bg = "#f8d7da"
+                color = "#721c24"
+            elif is_overflow:
+                bg = "#fff3cd"
+                color = "#856404"
+                weight = "bold"
+            elif is_changed:
+                bg = "#d4edda"
+                color = "#155724"
+                weight = "bold"
+
+            html += f'<td style="background-color: {bg}; color: {color}; font-weight: {weight}; border: 1px solid #dee2e6; padding: 6px 8px; white-space: nowrap;">{cell_val}</td>'
+        html += "</tr>"
+    html += "</tbody></table></div>"
+    return html
+
+# 完全保存用HTMLドキュメント生成
+def generate_full_html_document(df, id_col_name, day_lock_flags, changed_cells, overflow_cells):
+    table_body = render_custom_html_table(df, id_col_name, day_lock_flags, changed_cells, overflow_cells, max_height="none")
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>最適化シフト結果</title>
+    <style>
+        body {{ font-family: 'Helvetica Neue', Arial, sans-serif; padding: 20px; background-color: #fafafa; }}
+        h2 {{ color: #333; margin-bottom: 10px; }}
+        .legend {{ font-size: 12px; margin-bottom: 15px; color: #666; }}
+        .legend span {{ display: inline-block; padding: 3px 8px; margin-right: 10px; border-radius: 3px; font-weight: bold; }}
+        .changed {{ background-color: #d4edda; color: #155724; }}
+        .overflow {{ background-color: #fff3cd; color: #856404; }}
+        .locked {{ background-color: #f8d7da; color: #721c24; }}
+        .off {{ color: #d9534f; }}
+    </style>
+</head>
+<body>
+    <h2>📊 最適化シフト結果</h2>
+    <div class="legend">
+        凡例: 
+        <span class="changed">トレード変更</span>
+        <span class="overflow">エリア不一致（溢れ）</span>
+        <span class="locked">LOCK指定日</span>
+        <span class="off">休日セル</span>
+    </div>
+    {table_body}
+</body>
+</html>
+"""
+
+# 大画面モーダル表示用ダイアログ
+@st.dialog("📊 最適化結果（大画面プレビュー）", width="large")
+def show_large_preview(df, id_col_name, day_lock_flags, changed_cells, overflow_cells):
+    st.markdown(render_custom_html_table(df, id_col_name, day_lock_flags, changed_cells, overflow_cells, max_height="75vh"), unsafe_allow_html=True)
+
 if check_password():
     st.title("勤務変更補助システム")
     st.caption("自動シフトトレード・エリア最適化ソルバー (高速化版)")
@@ -203,12 +290,6 @@ if check_password():
                     return True
                 return task_trade_allowed_map.get(task_code, 'Y') == 'Y'
 
-            def get_start_type(task_code):
-                return task_start_type_map.get(task_code, '')
-
-            def get_end_type(task_code):
-                return task_end_type_map.get(task_code, '')
-
             ignored_rows = ['DAYTYPE', 'LOCK']
             df_sched = df_initial_raw[~df_initial_raw[id_col_name].apply(clean_str).isin(ignored_rows)].copy()
             df_sched[id_col_name] = df_sched[id_col_name].apply(clean_str)
@@ -253,9 +334,8 @@ if check_password():
                     tasks_by_day[d].add(val)
 
             all_tasks = list(all_tasks_set)
-            log(f"検出されたユニーク仕業数: {len(all_tasks)}件")
 
-            # --- モデル構築開始 ---
+            # --- CP-SAT モデル構築 ---
             model = cp_model.CpModel()
             x = {}
             for p in existing_members:
@@ -263,19 +343,16 @@ if check_password():
                     for t in all_tasks:
                         x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
-            # 各人は1日1仕業
             for d in dates:
                 for p in existing_members:
                     model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-            # トレード不可・LOCK日付の固定
             for p in existing_members:
                 for d in dates:
                     orig_t = initial_assignment.get((p, d), '公休')
                     if not is_trade_allowed(orig_t) or day_lock_flags.get(d, False):
                         model.Add(x[p, d, orig_t] == 1)
 
-            # 役職(Role)制約
             for p in existing_members:
                 p_role = member_role.get(p, '')
                 for d in dates:
@@ -289,7 +366,6 @@ if check_password():
                         elif p_role == 'C' and t.endswith('M'):
                             model.Add(x[p, d, t] == 0)
 
-            # 性別制約
             for p in existing_members:
                 p_gender = member_gender.get(p, '')
                 if p_gender == 'F':
@@ -300,7 +376,6 @@ if check_password():
                             if not is_trade_allowed(t) and not is_female_allowed(t):
                                 model.Add(x[p, d, t] == 0)
 
-            # 各仕業の必要人数維持
             for d in dates:
                 if day_lock_flags.get(d, False):
                     continue
@@ -311,7 +386,6 @@ if check_password():
                     required_count = tasks_today.count(t)
                     model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-            # ペア制約（2日連動）
             for d_idx in range(len(dates) - 1):
                 d_curr = dates[d_idx]
                 d_next = dates[d_idx + 1]
@@ -320,7 +394,6 @@ if check_password():
                         for p in existing_members:
                             model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
-            # ベースエリア制約（トレード先エリア制限）
             for p in existing_members:
                 p_base_area = member_base_area.get(p, 'ANY')
                 if p_base_area != 'ANY':
@@ -335,10 +408,9 @@ if check_password():
                             if t_area != 'ANY' and t_area != p_base_area:
                                 model.Add(x[p, d, t] == 0)
 
-            # --- 目的関数の構築 (軽量化) ---
+            # --- 目的関数 ---
             objective_terms = []
 
-            # 🔥【爆発防止】3連番一括トレードの候補絞り込みロジック
             triple_rules = []
             for t1, t2 in pair_rules.items():
                 if t2 in pair_rules:
@@ -354,7 +426,6 @@ if check_password():
                     if day_lock_flags.get(d1) or day_lock_flags.get(d2) or day_lock_flags.get(d3):
                         continue
 
-                    # 事前に「該当日に3連番を持っている人」だけを抽出して計算負荷を1/100に圧縮
                     p_triples = {}
                     for p in existing_members:
                         p_t1, p_t2, p_t3 = initial_assignment.get((p, d1)), initial_assignment.get((p, d2)), initial_assignment.get((p, d3))
@@ -368,10 +439,8 @@ if check_password():
                             (p1_t1, p1_t2, p1_t3) = p_triples[p1]
                             (p2_t1, p2_t2, p2_t3) = p_triples[p2]
 
-                            # 互いのパターンが違う場合のみスワップ変数を生成
                             if (p1_t1, p1_t2, p1_t3) != (p2_t1, p2_t2, p2_t3):
                                 triple_swap_var = model.NewBoolVar(f'tr_sw_{p1}_{p2}_{d1}')
-                                # p1がp2の3連番を受け取り、p2がp1の3連番を受け取る
                                 model.Add(x[p1, d1, p2_t1] == 1).OnlyEnforceIf(triple_swap_var)
                                 model.Add(x[p1, d2, p2_t2] == 1).OnlyEnforceIf(triple_swap_var)
                                 model.Add(x[p1, d3, p2_t3] == 1).OnlyEnforceIf(triple_swap_var)
@@ -382,7 +451,6 @@ if check_password():
                                 objective_terms.append(triple_swap_var * -100000)
                                 triple_trade_vars.append((p1, p2, d1, d2, d3, (p1_t1, p1_t2, p1_t3), (p2_t1, p2_t2, p2_t3), triple_swap_var))
 
-            # 溢れ(OverFlow)ペナルティ
             member_overflow_vars = {}
             for p in existing_members:
                 p_base_area = member_base_area.get(p, 'ANY')
@@ -406,7 +474,6 @@ if check_password():
                 weighted_penalty = 1000 + (past_of * 500)
                 objective_terms.append(of_var * weighted_penalty)
 
-            # 変更発生のわずかなペナルティ（無駄な変更を防ぐ）
             for p in existing_members:
                 for d in dates:
                     if day_lock_flags.get(d, False):
@@ -420,7 +487,6 @@ if check_password():
 
             log("ソルバーを実行中...")
             solver = cp_model.CpSolver()
-            # 🚀 タイムアウトとCPUスレッドを安全値に制限
             solver.parameters.max_time_in_seconds = 30.0
             solver.parameters.num_search_workers = 2
             
@@ -542,65 +608,39 @@ if check_password():
 
                     st.subheader("📊 最適化結果プレビュー")
                     
-                    OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
+                    # 🔍 大画面表示ボタン
+                    if st.button("🔍 プレビューを大画面（全画面風）で確認する", key="btn_modal"):
+                        show_large_preview(result_df, id_col, day_lock_flags, changed_cells, overflow_cells)
 
-                    def render_custom_html_table(df, id_col_name, day_lock_flags, changed_cells, overflow_cells):
-                        html = """
-                        <div style="overflow-x: auto; max-height: 500px; border: 1px solid #e6e6e6; border-radius: 5px; margin-bottom: 20px;">
-                        <table style="border-collapse: collapse; width: 100%; font-size: 12px; text-align: center;">
-                            <thead><tr style="background-color: #f8f9fa; position: sticky; top: 0; z-index: 10;">
-                        """
-                        for col in df.columns:
-                            html += f'<th style="border: 1px solid #dee2e6; padding: 8px; white-space: nowrap;">{col}</th>'
-                        html += "</tr></thead><tbody>"
+                    # 通常プレビュー描画
+                    st.markdown(render_custom_html_table(result_df, id_col, day_lock_flags, changed_cells, overflow_cells, max_height="500px"), unsafe_allow_html=True)
 
-                        for idx, row in df.iterrows():
-                            p_id = str(row[id_col_name])
-                            html += "<tr>"
-                            for col in df.columns:
-                                cell_val = str(row[col])
-                                str_col = str(col)
-                                is_locked = day_lock_flags.get(str_col, False)
-                                is_changed = (p_id, str_col) in changed_cells
-                                is_overflow = (p_id, str_col) in overflow_cells
-                                is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
+                    st.subheader("📥 結果ダウンロード")
+                    col1, col2 = st.columns(2)
 
-                                bg = "#ffffff"
-                                color = "#212529"
-                                weight = "normal"
+                    with col1:
+                        csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
+                        st.download_button(
+                            label="📥 CSVデータをダウンロード",
+                            data=csv_data,
+                            file_name="Optimized_Schedule.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="dl_csv"
+                        )
 
-                                if is_off:
-                                    bg = "#f8d7da" if is_locked else "#ffffff"
-                                    color = "#d9534f"
-                                    weight = "bold"
-                                elif is_locked:
-                                    bg = "#f8d7da"
-                                    color = "#721c24"
-                                elif is_overflow:
-                                    bg = "#fff3cd"
-                                    color = "#856404"
-                                    weight = "bold"
-                                elif is_changed:
-                                    bg = "#d4edda"
-                                    color = "#155724"
-                                    weight = "bold"
+                    with col2:
+                        # 🎨 カラーHTMLファイルの完全ダウンロード対応
+                        full_html_str = generate_full_html_document(result_df, id_col, day_lock_flags, changed_cells, overflow_cells)
+                        st.download_button(
+                            label="🎨 色付きHTML（印刷/PDF化用）をダウンロード",
+                            data=full_html_str.encode('utf-8-sig'),
+                            file_name="Optimized_Schedule_Colored.html",
+                            mime="text/html",
+                            use_container_width=True,
+                            key="dl_html"
+                        )
 
-                                html += f'<td style="background-color: {bg}; color: {color}; font-weight: {weight}; border: 1px solid #dee2e6; padding: 6px; white-space: nowrap;">{cell_val}</td>'
-                            html += "</tr>"
-                        html += "</tbody></table></div>"
-                        return html
-
-                    st.markdown(render_custom_html_table(result_df, id_col, day_lock_flags, changed_cells, overflow_cells), unsafe_allow_html=True)
-
-                    csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        label="📥 CSVファイルをダウンロード",
-                        data=csv_data,
-                        file_name="Optimized_Schedule.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                        key="dl_csv"
-                    )
                 else:
                     st.error(f"解が見つからなかったか、タイムアウトしました。（詳細: {log_msg}）")
 
