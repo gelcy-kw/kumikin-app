@@ -84,13 +84,11 @@ if check_password():
         all_cols = list(df_initial_raw.columns)
         meta_cols = [id_col_name, name_col_name]
         
-        # OF_M1, OF_M2 の列が存在する場合はメタ列として除外
         for col in all_cols:
             c_upper = col.upper().strip()
             if c_upper in ['OF_M1', 'OF_M2']:
                 meta_cols.append(col)
 
-        # 残りの列を「日付列」として定義
         dates = [clean_str(c) for c in all_cols if c not in meta_cols]
 
         # -------------------------------------------------------------
@@ -128,7 +126,7 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 3. 仕業マスターの動的パース
+        # 3. 仕業マスターの動的パース ＆ ペア・3連番ルールの構築
         # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
@@ -201,16 +199,15 @@ if check_password():
             return task_trade_allowed_map.get(task_code, 'Y') == 'Y'
 
         # -------------------------------------------------------------
-        # 4. 初期勤務表データの整理 ＆ 過去溢れ数（OF_M1, OF_M2）取得
+        # 4. 初期勤務表データの整理
         # -------------------------------------------------------------
         ignored_rows = ['DAYTYPE', 'LOCK']
         df_sched = df_initial_raw[~df_initial_raw[id_col_name].apply(clean_str).isin(ignored_rows)].copy()
         df_sched[id_col_name] = df_sched[id_col_name].apply(clean_str)
 
         member_names = {}
-        member_past_overflow = {} # (OF_M1 + OF_M2) の保持用マップ
+        member_past_overflow = {}
 
-        # 列名の表記揺れに対応（大文字・小文字・空白除去）
         col_m1 = next((c for c in df_sched.columns if c.upper().strip() == 'OF_M1'), None)
         col_m2 = next((c for c in df_sched.columns if c.upper().strip() == 'OF_M2'), None)
 
@@ -221,8 +218,6 @@ if check_password():
 
             of1 = parse_int_safely(row[col_m1]) if col_m1 else 0
             of2 = parse_int_safely(row[col_m2]) if col_m2 else 0
-            
-            # シンプル合算（先月 + 先々月）
             member_past_overflow[m_id] = of1 + of2
 
         df_initial_indexed = df_sched.set_index(id_col_name)
@@ -245,7 +240,7 @@ if check_password():
         all_tasks = list(all_tasks_set)
 
         # -------------------------------------------------------------
-        # 5. OR-Tools モデル構築
+        # 5. OR-Tools CP-SAT モデル構築
         # -------------------------------------------------------------
         model = cp_model.CpModel()
         x = {}
@@ -307,7 +302,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 制約 6. 日跨ぎペア制約
+        # 制約 6. 日跨ぎペア制約（2日連動）
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -333,13 +328,62 @@ if check_password():
                             model.Add(x[p, d, t] == 0)
 
         # -------------------------------------------------------------
-        # 目的関数（過去の溢れ数を考慮したスコアリング）
+        # 目的関数（3連番丸ごとトレード優先 ＆ 過去溢れ考慮）
         # -------------------------------------------------------------
         objective_terms = []
 
+        # --- 【新規機能】3連番丸ごとトレード（セット交換）の優先判定 ---
+        # 3連番チェーン（t1 -> t2 -> t3）を探索
+        triple_rules = []
+        for t1, t2 in pair_rules.items():
+            if t2 in pair_rules:
+                t3 = pair_rules[t2]
+                if t1 in all_tasks and t2 in all_tasks and t3 in all_tasks:
+                    triple_rules.append((t1, t2, t3))
+
+        triple_trade_vars = []
+
+        if len(dates) >= 3 and triple_rules:
+            for d_idx in range(len(dates) - 2):
+                d1, d2, d3 = dates[d_idx], dates[d_idx + 1], dates[d_idx + 2]
+
+                # 3日間のうちどれか1日でもLOCKされていればセットトレード不可
+                if day_lock_flags.get(d1) or day_lock_flags.get(d2) or day_lock_flags.get(d3):
+                    continue
+
+                for p1_idx in range(len(existing_members)):
+                    for p2_idx in range(p1_idx + 1, len(existing_members)):
+                        p1 = existing_members[p1_idx]
+                        p2 = existing_members[p2_idx]
+
+                        # 初期仕業の取得
+                        p1_t1, p1_t2, p1_t3 = initial_assignment.get((p1, d1)), initial_assignment.get((p1, d2)), initial_assignment.get((p1, d3))
+                        p2_t1, p2_t2, p2_t3 = initial_assignment.get((p2, d1)), initial_assignment.get((p2, d2)), initial_assignment.get((p2, d3))
+
+                        # どちらかの初期配置が3連番パターンにマッチし、かつ対象日のすべての仕業がトレード可能な場合のみ判定
+                        p1_is_triple = (p1_t1, p1_t2, p1_t3) in triple_rules and is_trade_allowed(p1_t1) and is_trade_allowed(p1_t2) and is_trade_allowed(p1_t3)
+                        p2_is_triple = (p2_t1, p2_t2, p2_t3) in triple_rules and is_trade_allowed(p2_t1) and is_trade_allowed(p2_t2) and is_trade_allowed(p2_t3)
+
+                        if p1_is_triple and p2_is_triple:
+                            # p1とp2が3日間の仕業をそっくり丸ごとトレードしたか判定するBool変数
+                            triple_swap_var = model.NewBoolVar(f'triple_swap_{p1}_{p2}_{d1}')
+
+                            # 3つのトレード条件を同時に満たす場合のみ triple_swap_var = 1
+                            # p1がp2の3日間仕業を担当し、かつp2がp1の3日間仕業を担当する
+                            conds = [
+                                x[p1, d1, p2_t1], x[p1, d2, p2_t2], x[p1, d3, p2_t3],
+                                x[p2, d1, p1_t1], x[p2, d2, p1_t2], x[p2, d3, p1_t3]
+                            ]
+                            model.AddMinEquality(triple_swap_var, conds)
+
+                            # 3連番丸ごとトレード成立時の絶大ボーナス（-100,000点）
+                            objective_terms.append(triple_swap_var * -100000)
+                            triple_trade_vars.append((p1, p2, d1, d2, d3, (p1_t1, p1_t2, p1_t3), (p2_t1, p2_t2, p2_t3), triple_swap_var))
+
+        # --- 基本トレードペナルティ ＆ エリア補正（自エリア復帰インセンティブ） ---
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
-            past_of = member_past_overflow.get(p, 0) # 過去の累計溢れ数（OF_M1 + OF_M2）
+            past_of = member_past_overflow.get(p, 0)
 
             for d in dates:
                 if day_lock_flags.get(d, False):
@@ -352,14 +396,11 @@ if check_password():
                     
                     t_area = get_task_area(t)
                     
-                    # 自エリア仕業への割り当てインセンティブ
                     if p_base_area != 'ANY' and t_area == p_base_area:
-                        # 過去に溢れが多かった人ほど、当月は優先的に自エリアに戻す（インセンティブを強化）
                         base_reward = -10000
                         overflow_penalty_factor = -100 * past_of
                         objective_terms.append(x[p, d, t] * (base_reward + overflow_penalty_factor))
                     
-                    # 初期配置からの変更ペナルティ
                     if t != orig_t:
                         objective_terms.append(x[p, d, t] * 1)
 
@@ -373,6 +414,7 @@ if check_password():
         status = solver.Solve(model)
 
         change_logs = []
+        triple_applied_logs = []
         pair_applied_logs = []
         changed_cells = set()
         overflow_cells = set()
@@ -391,6 +433,15 @@ if check_password():
                                 changed_cells.add((p, d))
                             break
 
+            # 3連番トレード適用ログの検出
+            for p1, p2, d1, d2, d3, (p1_t1, p1_t2, p1_t3), (p2_t1, p2_t2, p2_t3), svar in triple_trade_vars:
+                if solver.Value(svar) == 1:
+                    name1 = member_names.get(p1, p1)
+                    name2 = member_names.get(p2, p2)
+                    triple_applied_logs.append(
+                        f"【3連番一括トレード成立】{d1}〜{d3} : {name1}さん ({p1_t1}->{p1_t2}->{p1_t3}) 🔁 {name2}さん ({p2_t1}->{p2_t2}->{p2_t3})"
+                    )
+
             result_rows = []
             
             if not daytype_row.empty:
@@ -408,7 +459,6 @@ if check_password():
                 p_base_area = member_base_area.get(p, 'ANY')
                 overflow_count = 0
                 
-                # 元の行データをベースに作成（OF_M1, OF_M2の数値をそのまま保持するため）
                 row_src = df_initial_indexed.loc[p]
                 row = {
                     id_col_name: p,
@@ -424,7 +474,6 @@ if check_password():
                     task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                     row[d] = task_assigned
                     
-                    # 当月溢れ判定
                     if not day_lock_flags.get(d, False):
                         t_area = get_task_area(task_assigned)
                         if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
@@ -433,7 +482,6 @@ if check_password():
 
                 row['OverFlow'] = int(overflow_count)
                 
-                # 3ヶ月合計の溢れ数を算出・表示
                 past_of = member_past_overflow.get(p, 0)
                 row['3M_Total_OF'] = int(past_of + overflow_count)
 
@@ -453,9 +501,9 @@ if check_password():
                             f"【ペア整合確認】{p_name}さん({p}): {d_curr}『{work_curr}』 ➔ {d_next}『{work_next}』(完全連動)"
                         )
             
-            return df_result, True, "OK", change_logs, pair_applied_logs, [], [], changed_cells, overflow_cells, id_col_name, day_lock_flags
+            return df_result, True, "OK", change_logs, pair_applied_logs, triple_applied_logs, changed_cells, overflow_cells, id_col_name, day_lock_flags
         else:
-            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], [], [], [], set(), set(), "", {}
+            return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], [], [], set(), set(), "", {}
 
     st.subheader("2. 最適化計算の実行")
     if st.button("シフト最適化の実行"):
@@ -465,10 +513,16 @@ if check_password():
                 df_t = load_csv_safely(file_tasks)
                 df_i = load_csv_safely(file_initial)
                 
-                result_df, success, log_msg, change_logs, pair_debug_logs, _, _, changed_cells, overflow_cells, id_col, day_lock_flags = run_optimization(df_m, df_t, df_i)
+                result_df, success, log_msg, change_logs, pair_debug_logs, triple_logs, changed_cells, overflow_cells, id_col, day_lock_flags = run_optimization(df_m, df_t, df_i)
                 
                 if success:
                     st.success("最適化計算が完了しました！")
+
+                    if triple_logs:
+                        st.subheader("🔥 優先適用された【3連番一括トレード】")
+                        for tlog in triple_logs:
+                            st.success(tlog)
+
                     if change_logs:
                         st.subheader("📋 変更（トレード）された勤務一覧")
                         for clog in change_logs:
@@ -476,7 +530,7 @@ if check_password():
                     else:
                         st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（全ての勤務が自エリアと一致しています）")
 
-                    with st.expander("🔍 適用されたペア制約ログ"):
+                    with st.expander("🔍 適用されたペア制約（2日連動）ログ"):
                         for p_log in sorted(list(set(pair_debug_logs))):
                             st.write(p_log)
 
