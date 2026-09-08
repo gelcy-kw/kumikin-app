@@ -234,6 +234,7 @@ if check_password():
                 val = str(df_initial_indexed.loc[p, d]).strip() if pd.notna(df_initial_indexed.loc[p, d]) else '公休'
                 if not val:
                     val = '公休'
+                val = clean_str(val) # 小文字入力などの表記揺れ対策
                 initial_assignment[(p, d)] = val
                 all_tasks_set.add(val)
 
@@ -302,7 +303,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 制約 6. 日跨ぎペア制約（2日連動）
+        # 制約 6. 日跨ぎペア制約（2日連動）※月末日を除外して月またぎ泊まりに対応！
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -332,7 +333,6 @@ if check_password():
         # -------------------------------------------------------------
         objective_terms = []
 
-        # --- 【新規機能】3連番丸ごとトレード（セット交換）の優先判定 ---
         # 3連番チェーン（t1 -> t2 -> t3）を探索
         triple_rules = []
         for t1, t2 in pair_rules.items():
@@ -347,7 +347,6 @@ if check_password():
             for d_idx in range(len(dates) - 2):
                 d1, d2, d3 = dates[d_idx], dates[d_idx + 1], dates[d_idx + 2]
 
-                # 3日間のうちどれか1日でもLOCKされていればセットトレード不可
                 if day_lock_flags.get(d1) or day_lock_flags.get(d2) or day_lock_flags.get(d3):
                     continue
 
@@ -356,31 +355,23 @@ if check_password():
                         p1 = existing_members[p1_idx]
                         p2 = existing_members[p2_idx]
 
-                        # 初期仕業の取得
                         p1_t1, p1_t2, p1_t3 = initial_assignment.get((p1, d1)), initial_assignment.get((p1, d2)), initial_assignment.get((p1, d3))
                         p2_t1, p2_t2, p2_t3 = initial_assignment.get((p2, d1)), initial_assignment.get((p2, d2)), initial_assignment.get((p2, d3))
 
-                        # どちらかの初期配置が3連番パターンにマッチし、かつ対象日のすべての仕業がトレード可能な場合のみ判定
                         p1_is_triple = (p1_t1, p1_t2, p1_t3) in triple_rules and is_trade_allowed(p1_t1) and is_trade_allowed(p1_t2) and is_trade_allowed(p1_t3)
                         p2_is_triple = (p2_t1, p2_t2, p2_t3) in triple_rules and is_trade_allowed(p2_t1) and is_trade_allowed(p2_t2) and is_trade_allowed(p2_t3)
 
                         if p1_is_triple and p2_is_triple:
-                            # p1とp2が3日間の仕業をそっくり丸ごとトレードしたか判定するBool変数
                             triple_swap_var = model.NewBoolVar(f'triple_swap_{p1}_{p2}_{d1}')
-
-                            # 3つのトレード条件を同時に満たす場合のみ triple_swap_var = 1
-                            # p1がp2の3日間仕業を担当し、かつp2がp1の3日間仕業を担当する
                             conds = [
                                 x[p1, d1, p2_t1], x[p1, d2, p2_t2], x[p1, d3, p2_t3],
                                 x[p2, d1, p1_t1], x[p2, d2, p1_t2], x[p2, d3, p1_t3]
                             ]
                             model.AddMinEquality(triple_swap_var, conds)
-
-                            # 3連番丸ごとトレード成立時の絶大ボーナス（-100,000点）
                             objective_terms.append(triple_swap_var * -100000)
                             triple_trade_vars.append((p1, p2, d1, d2, d3, (p1_t1, p1_t2, p1_t3), (p2_t1, p2_t2, p2_t3), triple_swap_var))
 
-        # --- 基本トレードペナルティ ＆ エリア補正（自エリア復帰インセンティブ） ---
+        # 基本トレードペナルティ ＆ エリア補正（自エリア復帰インセンティブ）
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
             past_of = member_past_overflow.get(p, 0)
@@ -433,7 +424,6 @@ if check_password():
                                 changed_cells.add((p, d))
                             break
 
-            # 3連番トレード適用ログの検出
             for p1, p2, d1, d2, d3, (p1_t1, p1_t2, p1_t3), (p2_t1, p2_t2, p2_t3), svar in triple_trade_vars:
                 if solver.Value(svar) == 1:
                     name1 = member_names.get(p1, p1)
@@ -501,7 +491,7 @@ if check_password():
                             f"【ペア整合確認】{p_name}さん({p}): {d_curr}『{work_curr}』 ➔ {d_next}『{work_next}』(完全連動)"
                         )
             
-            return df_result, True, "OK", change_logs, pair_applied_logs, triple_applied_logs, changed_cells, overflow_cells, id_col_name, day_lock_flags
+            return df_result, True, "OK", change_logs, pair_debug_logs, triple_applied_logs, changed_cells, overflow_cells, id_col_name, day_lock_flags
         else:
             return df_initial_raw, False, f"Solver Status: {solver.StatusName(status)}", [], [], [], set(), set(), "", {}
 
