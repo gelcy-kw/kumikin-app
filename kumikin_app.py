@@ -261,7 +261,6 @@ if check_password():
             first_date = dates[0] if dates else None
             last_date = dates[-1] if dates else None
 
-            # --- 🔥 境界ペア保護フラグ判定関数 ---
             def is_boundary_pair_task(p, d):
                 orig_t = initial_assignment.get((p, d), '公休')
                 if d == last_date and orig_t in first_day_pair_tasks:
@@ -461,7 +460,6 @@ if check_password():
                                 model.AddMinEquality(load_diff_var, [x[p1, d, orig2], x[p2, d, orig1]])
                                 objective_terms.append(load_diff_var * LOAD_DIFF_PENALTY_WEIGHT)
 
-            # --- 🔥 溢れ数（OverFlow）計算における境界ペア除外 ---
             member_overflow_vars = {}
             for p in existing_members:
                 p_base_area = member_base_area.get(p, 'ANY')
@@ -472,7 +470,6 @@ if check_password():
                         if day_lock_flags.get(d, False):
                             continue
                         
-                        # 🔥 月末月初保護対象（is_boundary_pair_task）なら溢れ計算から完全除外
                         if is_boundary_pair_task(p, d):
                             continue
 
@@ -575,7 +572,6 @@ if check_password():
                         task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                         row[d] = task_assigned
                         
-                        # 🔥 月末月初の強制固定セル（is_boundary_pair_task）は集計時も OverFlow カウントから除外
                         if not day_lock_flags.get(d, False) and is_trade_allowed(task_assigned) and not is_boundary_pair_task(p, d):
                             t_area = get_task_area(task_assigned)
                             if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
@@ -637,14 +633,15 @@ if check_password():
                         for tlog in triple_logs:
                             st.success(tlog)
 
+                    # 🔥 トレードされた勤務ログを expander（折りたたみ）に格納
                     if change_logs:
-                        st.subheader("📋 変更（トレード）された勤務一覧")
-                        for clog in change_logs:
-                            st.write(clog)
+                        with st.expander(f"📋 変更（トレード）された勤務一覧 ({len(change_logs)}件)", expanded=False):
+                            for clog in change_logs:
+                                st.write(clog)
                     else:
                         st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（全ての勤務が自エリアと一致しています）")
 
-                    with st.expander("🔍 適用されたペア制約（2日連動）ログ"):
+                    with st.expander("🔍 適用されたペア制約（2日連動）ログ", expanded=False):
                         for p_log in sorted(list(set(pair_debug_logs))):
                             st.write(p_log)
 
