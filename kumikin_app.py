@@ -192,7 +192,6 @@ if check_password():
 
             log(f"構築されたペア制約数: {len(pair_rules)}件")
 
-            # --- 🔥 ペアの1日目（前半）と2日目（後半）を判定するセット ---
             first_day_pair_tasks = set(pair_rules.keys())
             second_day_pair_tasks = set(pair_rules.values())
 
@@ -259,6 +258,18 @@ if check_password():
             all_tasks = list(all_tasks_set)
             log(f"検出されたユニーク仕業数: {len(all_tasks)}件")
 
+            first_date = dates[0] if dates else None
+            last_date = dates[-1] if dates else None
+
+            # --- 🔥 境界ペア保護フラグ判定関数 ---
+            def is_boundary_pair_task(p, d):
+                orig_t = initial_assignment.get((p, d), '公休')
+                if d == last_date and orig_t in first_day_pair_tasks:
+                    return True
+                if d == first_date and orig_t in second_day_pair_tasks:
+                    return True
+                return False
+
             model = cp_model.CpModel()
             x = {}
             for p in existing_members:
@@ -270,17 +281,11 @@ if check_password():
                 for p in existing_members:
                     model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-            # --- 🔥 月初日（第1列）と月末日（最終列）の自動判定 ---
-            first_date = dates[0] if dates else None
-            last_date = dates[-1] if dates else None
-
             for p in existing_members:
                 for d in dates:
                     orig_t = initial_assignment.get((p, d), '公休')
                     
-                    # 🔥 月末日の泊まり1日目（翌月連動なし）の判定
                     is_last_day_pair_first = (d == last_date and orig_t in first_day_pair_tasks)
-                    # 🔥 月初日の泊まり2日目（前月連動なし）の判定
                     is_first_day_pair_second = (d == first_date and orig_t in second_day_pair_tasks)
 
                     if not is_trade_allowed(orig_t) or day_lock_flags.get(d, False) or is_last_day_pair_first or is_first_day_pair_second:
@@ -329,7 +334,6 @@ if check_password():
                     required_count = tasks_today.count(t)
                     model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-            # --- 1対1ペアトレード限定制約（三つ巴・複数トレード禁止） ---
             for d in dates:
                 if day_lock_flags.get(d, False):
                     continue
@@ -341,9 +345,8 @@ if check_password():
                         orig1 = initial_assignment.get((p1, d), '公休')
                         orig2 = initial_assignment.get((p2, d), '公休')
                         
-                        # 月初・月末の境界ペア保護判定
-                        p1_boundary_pair = (d == last_date and orig1 in first_day_pair_tasks) or (d == first_date and orig1 in second_day_pair_tasks)
-                        p2_boundary_pair = (d == last_date and orig2 in first_day_pair_tasks) or (d == first_date and orig2 in second_day_pair_tasks)
+                        p1_boundary_pair = is_boundary_pair_task(p1, d)
+                        p2_boundary_pair = is_boundary_pair_task(p2, d)
 
                         if orig1 != orig2 and is_trade_allowed(orig1) and is_trade_allowed(orig2) and not p1_boundary_pair and not p2_boundary_pair:
                             s_var = model.NewBoolVar(f'pair_swap_{p1}_{p2}_{d}')
@@ -352,9 +355,7 @@ if check_password():
 
                 for p in existing_members:
                     orig_t = initial_assignment.get((p, d), '公休')
-                    is_boundary_pair = (d == last_date and orig_t in first_day_pair_tasks) or (d == first_date and orig_t in second_day_pair_tasks)
-
-                    if not is_trade_allowed(orig_t) or is_boundary_pair:
+                    if not is_trade_allowed(orig_t) or is_boundary_pair_task(p, d):
                         continue
                     
                     p_swaps = []
@@ -440,7 +441,6 @@ if check_password():
                                     model.AddMinEquality(late_early_var, [x[p, d_curr, t_curr], x[p, d_next, t_next]])
                                     objective_terms.append(late_early_var * LATE_EARLY_PENALTY_WEIGHT)
 
-            # --- 🔥 【追加】Load 1 と Load 3 のトレード評価ペナルティ ---
             LOAD_DIFF_PENALTY_WEIGHT = 20
 
             for d in dates:
@@ -461,6 +461,7 @@ if check_password():
                                 model.AddMinEquality(load_diff_var, [x[p1, d, orig2], x[p2, d, orig1]])
                                 objective_terms.append(load_diff_var * LOAD_DIFF_PENALTY_WEIGHT)
 
+            # --- 🔥 溢れ数（OverFlow）計算における境界ペア除外 ---
             member_overflow_vars = {}
             for p in existing_members:
                 p_base_area = member_base_area.get(p, 'ANY')
@@ -470,6 +471,11 @@ if check_password():
                     for d in dates:
                         if day_lock_flags.get(d, False):
                             continue
+                        
+                        # 🔥 月末月初保護対象（is_boundary_pair_task）なら溢れ計算から完全除外
+                        if is_boundary_pair_task(p, d):
+                            continue
+
                         for t in all_tasks:
                             if not is_trade_allowed(t):
                                 continue
@@ -569,7 +575,8 @@ if check_password():
                         task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                         row[d] = task_assigned
                         
-                        if not day_lock_flags.get(d, False) and is_trade_allowed(task_assigned):
+                        # 🔥 月末月初の強制固定セル（is_boundary_pair_task）は集計時も OverFlow カウントから除外
+                        if not day_lock_flags.get(d, False) and is_trade_allowed(task_assigned) and not is_boundary_pair_task(p, d):
                             t_area = get_task_area(task_assigned)
                             if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
                                 overflow_count += 1
