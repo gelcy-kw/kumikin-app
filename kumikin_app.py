@@ -61,15 +61,15 @@ def normalize_area_dynamic(val):
 def is_off_or_vacation(task_code):
     if not task_code:
         return True
-    OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
+    OFF_KEYWORDS = ['週休', '休暇', 'OFF', '免']
     return any(kw in task_code for kw in OFF_KEYWORDS)
 
 if check_password():
     st.title("勤務変更補助システム")
-    st.caption("自動シフトトレード・エリア最適化ソルバー")
+    st.caption("自動仕業トレード・出勤地最適化ソルバー")
 
     st.subheader("1. データファイルのアップロード")
-    file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"])
+    file_members = st.file_uploader("人員マスター (Member_Master.csv)", type=["csv"])
     file_tasks = st.file_uploader("仕業マスター (Task_Master.csv)", type=["csv"])
     file_initial = st.file_uploader("初期勤務表 (Initial_Schedule.csv)", type=["csv"])
 
