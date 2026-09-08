@@ -45,6 +45,15 @@ def parse_trade_allowed(val):
         return 'N'
     return 'Y'
 
+def parse_int_safely(val):
+    """ 溢れ数（OF_M1, OF_M2）などの数値入力を安全に整数化（数値以外や空欄は0埋め） """
+    if pd.isna(val):
+        return 0
+    try:
+        return int(float(str(val).strip()))
+    except (ValueError, TypeError):
+        return 0
+
 def normalize_area_dynamic(val):
     s = clean_str(val)
     return s if s else 'ANY'
@@ -68,7 +77,21 @@ if check_password():
     def run_optimization(df_members, df_tasks, df_initial_raw):
         id_col_name = df_initial_raw.columns[0]
         name_col_name = df_initial_raw.columns[1]
-        dates = [clean_str(c) for c in df_initial_raw.columns[2:]]
+
+        # -------------------------------------------------------------
+        # 日付列と特殊列（OF_M1, OF_M2）の動的判定
+        # -------------------------------------------------------------
+        all_cols = list(df_initial_raw.columns)
+        meta_cols = [id_col_name, name_col_name]
+        
+        # OF_M1, OF_M2 の列が存在する場合はメタ列として除外
+        for col in all_cols:
+            c_upper = col.upper().strip()
+            if c_upper in ['OF_M1', 'OF_M2']:
+                meta_cols.append(col)
+
+        # 残りの列を「日付列」として定義
+        dates = [clean_str(c) for c in all_cols if c not in meta_cols]
 
         # -------------------------------------------------------------
         # 1. 制御行（LOCK行）および DAYTYPE行 の判定
@@ -76,7 +99,7 @@ if check_password():
         lock_row = df_initial_raw[df_initial_raw[id_col_name].apply(clean_str) == 'LOCK']
         day_lock_flags = {}
         for d in dates:
-            if not lock_row.empty:
+            if not lock_row.empty and d in lock_row.columns:
                 val = clean_str(lock_row.iloc[0][d])
                 day_lock_flags[d] = val in ['LOCK', '1', 'YES', 'TRUE', '固定']
             else:
@@ -105,7 +128,7 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 3. 仕業マスターの動的パース (TradeAllowedの判定および入力揺れ補正)
+        # 3. 仕業マスターの動的パース
         # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
@@ -118,11 +141,9 @@ if check_password():
                 t_area = normalize_area_dynamic(row.get('TargetArea', ''))
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
                 
-                # TradeAllowed列が存在する場合は入力揺れをサニタイズして取得
                 if 'TradeAllowed' in df_tasks.columns:
                     trade_allowed = parse_trade_allowed(row.get('TradeAllowed'))
                 else:
-                    # 後方互換：列がない場合、先頭が数字でなければトレード不可(N)とみなす
                     trade_allowed = 'N' if (t_id and not t_id[0].isdigit()) else 'Y'
 
                 pair_id = clean_str(row.get('PairTaskID', ''))
@@ -131,7 +152,6 @@ if check_password():
                 task_female_allowed_map[t_id] = f_allowed
                 task_trade_allowed_map[t_id] = trade_allowed
 
-                # 従来のID表記(例: 101M)やロングID(例: M_1_W)からのショートID抽出ロジック
                 m_match = re.match(r'^(\d+)([MC])$', t_id)
                 if m_match:
                     num_str = m_match.group(1)
@@ -174,7 +194,6 @@ if check_password():
         def is_trade_allowed(task_code):
             if is_off_or_vacation(task_code):
                 return False
-            # Task_Masterに未定義で先頭が英字のものはトレード不可
             if task_code not in task_trade_allowed_map:
                 if task_code and not task_code[0].isdigit():
                     return False
@@ -182,17 +201,29 @@ if check_password():
             return task_trade_allowed_map.get(task_code, 'Y') == 'Y'
 
         # -------------------------------------------------------------
-        # 4. 初期勤務表データの整理
+        # 4. 初期勤務表データの整理 ＆ 過去溢れ数（OF_M1, OF_M2）取得
         # -------------------------------------------------------------
         ignored_rows = ['DAYTYPE', 'LOCK']
         df_sched = df_initial_raw[~df_initial_raw[id_col_name].apply(clean_str).isin(ignored_rows)].copy()
         df_sched[id_col_name] = df_sched[id_col_name].apply(clean_str)
 
         member_names = {}
+        member_past_overflow = {} # (OF_M1 + OF_M2) の保持用マップ
+
+        # 列名の表記揺れに対応（大文字・小文字・空白除去）
+        col_m1 = next((c for c in df_sched.columns if c.upper().strip() == 'OF_M1'), None)
+        col_m2 = next((c for c in df_sched.columns if c.upper().strip() == 'OF_M2'), None)
+
         for _, row in df_sched.iterrows():
             m_id = clean_str(row[id_col_name])
             m_name = str(row[name_col_name]).strip() if pd.notna(row[name_col_name]) else m_id
             member_names[m_id] = m_name
+
+            of1 = parse_int_safely(row[col_m1]) if col_m1 else 0
+            of2 = parse_int_safely(row[col_m2]) if col_m2 else 0
+            
+            # シンプル合算（先月 + 先々月）
+            member_past_overflow[m_id] = of1 + of2
 
         df_initial_indexed = df_sched.set_index(id_col_name)
         
@@ -223,24 +254,22 @@ if check_password():
                 for t in all_tasks:
                     x[p, d, t] = model.NewBoolVar(f'x_{p}_{d}_{t}')
 
-        # 1. 1人1日1仕業
+        # 制約 1. 1人1日1仕業
         for d in dates:
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 2. トレード不可仕業（OFF・公休・休暇・TradeAllowed=N） ＆ LOCK日の全員固定
+        # 制約 2. トレード不可仕業 ＆ LOCK日の全員固定
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), '公休')
-                
-                # トレード不可、または LOCK日 の場合は初期配置に完全固定
                 if not is_trade_allowed(orig_t) or day_lock_flags.get(d, False):
                     for t in all_tasks:
                         if t != orig_t:
                             model.Add(x[p, d, t] == 0)
                     model.Add(x[p, d, orig_t] == 1)
 
-        # 3. 役職マッチング
+        # 制約 3. 役職マッチング
         for p in existing_members:
             p_role = member_role.get(p, '')
             for d in dates:
@@ -254,7 +283,7 @@ if check_password():
                     elif p_role == 'C' and t.endswith('M'):
                         model.Add(x[p, d, t] == 0)
 
-        # 4. 女性不可仕業ガード
+        # 制約 4. 女性不可仕業ガード
         for p in existing_members:
             p_gender = member_gender.get(p, '')
             if p_gender == 'F':
@@ -267,7 +296,7 @@ if check_password():
                         if not is_female_allowed(t):
                             model.Add(x[p, d, t] == 0)
 
-        # 5. 各日の仕業人数の維持
+        # 制約 5. 各日の仕業人数の維持
         for d in dates:
             if day_lock_flags.get(d, False):
                 continue
@@ -278,7 +307,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 6. 日跨ぎペア制約
+        # 制約 6. 日跨ぎペア制約
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
@@ -288,7 +317,7 @@ if check_password():
                     for p in existing_members:
                         model.Add(x[p, d_curr, work_curr] == x[p, d_next, work_next_required])
 
-        # 7. 他エリア仕業への新規割り当て禁止
+        # 制約 7. 他エリア仕業への新規割り当て禁止
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
             if p_base_area != 'ANY':
@@ -304,12 +333,14 @@ if check_password():
                             model.Add(x[p, d, t] == 0)
 
         # -------------------------------------------------------------
-        # 目的関数
+        # 目的関数（過去の溢れ数を考慮したスコアリング）
         # -------------------------------------------------------------
         objective_terms = []
 
         for p in existing_members:
             p_base_area = member_base_area.get(p, 'ANY')
+            past_of = member_past_overflow.get(p, 0) # 過去の累計溢れ数（OF_M1 + OF_M2）
+
             for d in dates:
                 if day_lock_flags.get(d, False):
                     continue
@@ -321,9 +352,14 @@ if check_password():
                     
                     t_area = get_task_area(t)
                     
+                    # 自エリア仕業への割り当てインセンティブ
                     if p_base_area != 'ANY' and t_area == p_base_area:
-                        objective_terms.append(x[p, d, t] * -10000)
+                        # 過去に溢れが多かった人ほど、当月は優先的に自エリアに戻す（インセンティブを強化）
+                        base_reward = -10000
+                        overflow_penalty_factor = -100 * past_of
+                        objective_terms.append(x[p, d, t] * (base_reward + overflow_penalty_factor))
                     
+                    # 初期配置からの変更ペナルティ
                     if t != orig_t:
                         objective_terms.append(x[p, d, t] * 1)
 
@@ -360,25 +396,35 @@ if check_password():
             if not daytype_row.empty:
                 r_dict = daytype_row.iloc[0].to_dict()
                 r_dict['OverFlow'] = ''
+                r_dict['3M_Total_OF'] = ''
                 result_rows.append(r_dict)
             if not lock_row.empty:
                 r_dict = lock_row.iloc[0].to_dict()
                 r_dict['OverFlow'] = ''
+                r_dict['3M_Total_OF'] = ''
                 result_rows.append(r_dict)
 
             for p in existing_members:
                 p_base_area = member_base_area.get(p, 'ANY')
                 overflow_count = 0
                 
+                # 元の行データをベースに作成（OF_M1, OF_M2の数値をそのまま保持するため）
+                row_src = df_initial_indexed.loc[p]
                 row = {
                     id_col_name: p,
                     name_col_name: member_names.get(p, '')
                 }
+
+                if col_m1:
+                    row[col_m1] = parse_int_safely(row_src.get(col_m1, 0))
+                if col_m2:
+                    row[col_m2] = parse_int_safely(row_src.get(col_m2, 0))
+
                 for d in dates:
                     task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                     row[d] = task_assigned
                     
-                    # 溢れ判定
+                    # 当月溢れ判定
                     if not day_lock_flags.get(d, False):
                         t_area = get_task_area(task_assigned)
                         if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
@@ -386,6 +432,11 @@ if check_password():
                             overflow_cells.add((p, d))
 
                 row['OverFlow'] = int(overflow_count)
+                
+                # 3ヶ月合計の溢れ数を算出・表示
+                past_of = member_past_overflow.get(p, 0)
+                row['3M_Total_OF'] = int(past_of + overflow_count)
+
                 result_rows.append(row)
 
             df_result = pd.DataFrame(result_rows)
