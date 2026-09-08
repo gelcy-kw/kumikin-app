@@ -367,7 +367,6 @@ if check_password():
                         if day_lock_flags.get(d, False):
                             continue
                         for t in all_tasks:
-                            # TradeAllowedがNの仕業は溢れカウントから除外
                             if not is_trade_allowed(t):
                                 continue
                             t_area = get_task_area(t)
@@ -466,7 +465,6 @@ if check_password():
                         task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                         row[d] = task_assigned
                         
-                        # LOCK日ではなく、かつトレード可能な仕業(is_trade_allowed)の場合のみ溢れ判定
                         if not day_lock_flags.get(d, False) and is_trade_allowed(task_assigned):
                             t_area = get_task_area(task_assigned)
                             if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
@@ -481,6 +479,13 @@ if check_password():
                     result_rows.append(row)
 
                 df_result = pd.DataFrame(result_rows)
+
+                # ★ OF_M1, OF_M2 列を整数表記（小数点なし）に明示的に変換する
+                for m_col in [col_m1, col_m2]:
+                    if m_col and m_col in df_result.columns:
+                        df_result[m_col] = df_result[m_col].apply(
+                            lambda v: int(float(v)) if pd.notna(v) and str(v).strip() != '' and str(v).replace('.','',1).isdigit() else ''
+                        )
 
                 for d_idx in range(len(dates) - 1):
                     d_curr = dates[d_idx]
