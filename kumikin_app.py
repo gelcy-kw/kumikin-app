@@ -36,6 +36,15 @@ def clean_str(val):
     s = str(val).strip()
     return s[:-2].upper() if s.endswith('.0') else s.upper()
 
+def parse_trade_allowed(val):
+    """ TradeAllowed列の入力揺れ（y/n, Yes/No, 大文字小文字など）を吸収してY/Nに正規化する """
+    if pd.isna(val):
+        return 'Y'
+    s = str(val).strip().upper()
+    if s in ['N', 'NO', '0', 'FALSE', 'NG', '固定', '不可']:
+        return 'N'
+    return 'Y'
+
 def normalize_area_dynamic(val):
     s = clean_str(val)
     return s if s else 'ANY'
@@ -96,7 +105,7 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 3. 仕業マスターの動的パース (TradeAllowedの追加)
+        # 3. 仕業マスターの動的パース (TradeAllowedの判定および入力揺れ補正)
         # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
@@ -108,20 +117,21 @@ if check_password():
                 t_id = clean_str(row['TaskID'])
                 t_area = normalize_area_dynamic(row.get('TargetArea', ''))
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
-                trade_allowed = clean_str(row.get('TradeAllowed', 'Y'))
-                pair_id = clean_str(row.get('PairTaskID', ''))
+                
+                # TradeAllowed列が存在する場合は入力揺れをサニタイズして取得
+                if 'TradeAllowed' in df_tasks.columns:
+                    trade_allowed = parse_trade_allowed(row.get('TradeAllowed'))
+                else:
+                    # 後方互換：列がない場合、先頭が数字でなければトレード不可(N)とみなす
+                    trade_allowed = 'N' if (t_id and not t_id[0].isdigit()) else 'Y'
 
-                # デフォルトでTradeAllowed列がない場合はアルファベット有無で判定（後方互換）
-                if 'TradeAllowed' not in df_tasks.columns:
-                    if t_id and not t_id[0].isdigit():
-                        trade_allowed = 'N'
-                    else:
-                        trade_allowed = 'Y'
+                pair_id = clean_str(row.get('PairTaskID', ''))
 
                 task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
                 task_trade_allowed_map[t_id] = trade_allowed
 
+                # 従来のID表記(例: 101M)やロングID(例: M_1_W)からのショートID抽出ロジック
                 m_match = re.match(r'^(\d+)([MC])$', t_id)
                 if m_match:
                     num_str = m_match.group(1)
@@ -164,7 +174,7 @@ if check_password():
         def is_trade_allowed(task_code):
             if is_off_or_vacation(task_code):
                 return False
-            # Task_Masterに定義されていない仕業で、先頭が英字の場合はトレード不可
+            # Task_Masterに未定義で先頭が英字のものはトレード不可
             if task_code not in task_trade_allowed_map:
                 if task_code and not task_code[0].isdigit():
                     return False
@@ -223,7 +233,7 @@ if check_password():
             for d in dates:
                 orig_t = initial_assignment.get((p, d), '公休')
                 
-                # トレード不可、または LOCK日 の場合は固定
+                # トレード不可、または LOCK日 の場合は初期配置に完全固定
                 if not is_trade_allowed(orig_t) or day_lock_flags.get(d, False):
                     for t in all_tasks:
                         if t != orig_t:
@@ -441,17 +451,13 @@ if check_password():
                                 
                                 is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
 
-                                # 1. 週休・休暇などは白背景＋赤文字太字
                                 if is_off:
                                     bg_color = '#f8d7da' if is_locked else '#ffffff'
                                     style_df.loc[idx, col] = f'background-color: {bg_color}; color: #d9534f; font-weight: bold;'
-                                # 2. LOCK指定の日（列全体を薄ピンクに）
                                 elif is_locked:
                                     style_df.loc[idx, col] = 'background-color: #f8d7da; color: #721c24;'
-                                # 3. 溢れセル（黄色に）
                                 elif is_overflow:
                                     style_df.loc[idx, col] = 'background-color: #fff3cd; color: #856404; font-weight: bold;'
-                                # 4. トレード変更セル（黄緑に）
                                 elif is_changed:
                                     style_df.loc[idx, col] = 'background-color: #d4edda; color: #155724; font-weight: bold;'
                                     
