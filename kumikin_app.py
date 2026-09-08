@@ -234,7 +234,7 @@ if check_password():
                 val = str(df_initial_indexed.loc[p, d]).strip() if pd.notna(df_initial_indexed.loc[p, d]) else '公休'
                 if not val:
                     val = '公休'
-                val = clean_str(val) # 小文字入力などの表記揺れ対策
+                val = clean_str(val)
                 initial_assignment[(p, d)] = val
                 all_tasks_set.add(val)
 
@@ -303,7 +303,7 @@ if check_password():
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
-        # 制約 6. 日跨ぎペア制約（2日連動）※月末日を除外して月またぎ泊まりに対応！
+        # 制約 6. 日跨ぎペア制約（2日連動）※月頭と月末の単体仕業に完全対応！
         for d_idx in range(len(dates) - 1):
             d_curr = dates[d_idx]
             d_next = dates[d_idx + 1]
