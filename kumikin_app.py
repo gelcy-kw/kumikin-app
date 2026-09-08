@@ -1,4 +1,79 @@
-def run_optimization(df_members, df_tasks, df_initial_raw):
+import streamlit as st
+import pandas as pd
+import re
+import traceback
+import io
+from ortools.sat.python import cp_model
+
+st.set_page_config(page_title="勤務変更補助システム", layout="centered")
+
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+
+    if not st.session_state["password_correct"]:
+        st.title("🔒 アクセス制限")
+        pwd = st.text_input("パスコードを入力してください", type="password")
+        if st.button("ログイン"):
+            if pwd == "1026":
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("パスコードが正しくありません")
+        return False
+    return True
+
+def load_csv_safely(uploaded_file):
+    try:
+        df = pd.read_csv(uploaded_file, encoding='utf-8')
+    except (UnicodeDecodeError, pd.errors.ParserError):
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file, encoding='cp932')
+    df.columns = df.columns.str.strip()
+    return df
+
+def clean_str(val):
+    if pd.isna(val):
+        return ""
+    s = str(val).strip()
+    return s[:-2].upper() if s.endswith('.0') else s.upper()
+
+def parse_trade_allowed(val):
+    if pd.isna(val):
+        return 'Y'
+    s = str(val).strip().upper()
+    if s in ['N', 'NO', '0', 'FALSE', 'NG', '固定', '不可']:
+        return 'N'
+    return 'Y'
+
+def parse_int_safely(val):
+    if pd.isna(val):
+        return 0
+    try:
+        return int(float(str(val).strip()))
+    except (ValueError, TypeError):
+        return 0
+
+def normalize_area_dynamic(val):
+    s = clean_str(val)
+    return s if s else 'ANY'
+
+def is_off_or_vacation(task_code):
+    if not task_code:
+        return True
+    OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
+    return any(kw in task_code for kw in OFF_KEYWORDS)
+
+if check_password():
+    st.title("勤務変更補助システム")
+    st.caption("自動シフトトレード・エリア最適化ソルバー")
+
+    st.subheader("1. データファイルのアップロード")
+    file_members = st.file_uploader("メンバーマスター (Member_Master.csv)", type=["csv"])
+    file_tasks = st.file_uploader("仕業マスター (Task_Master.csv)", type=["csv"])
+    file_initial = st.file_uploader("初期勤務表 (Initial_Schedule.csv)", type=["csv"])
+
+    def run_optimization(df_members, df_tasks, df_initial_raw):
         debug_logs = []
         def log(msg):
             debug_logs.append(msg)
@@ -17,13 +92,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                 if c_upper in ['OF_M1', 'OF_M2']:
                     meta_cols.append(col)
 
-            # 🔥 修正: UNNAMED列（余計な空列）や空文字を除外して正しい日付だけを抽出
-            dates = []
-            for c in all_cols:
-                c_clean = clean_str(c)
-                if c not in meta_cols and not c_clean.startswith('UNNAMED') and c_clean != '':
-                    dates.append(c_clean)
-
+            dates = [clean_str(c) for c in all_cols if c not in meta_cols]
             log(f"検出された対象日付（{len(dates)}件）: {dates}")
 
             lock_row = df_initial_raw[df_initial_raw[id_col_name].apply(clean_str) == 'LOCK']
@@ -117,6 +186,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
 
             log(f"構築されたペア制約数: {len(pair_rules)}件")
 
+            # --- 🔥 ペアの1日目（前半）と2日目（後半）を判定するセット ---
             first_day_pair_tasks = set(pair_rules.keys())
             second_day_pair_tasks = set(pair_rules.values())
 
@@ -141,26 +211,22 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
             df_sched = df_initial_raw[~df_initial_raw[id_col_name].apply(clean_str).isin(ignored_rows)].copy()
             df_sched[id_col_name] = df_sched[id_col_name].apply(clean_str)
 
-            # 🔥 修正: 列名もキレイにしてからインデックス化する
-            df_sched.columns = [clean_str(c) for c in df_sched.columns]
-            clean_id_col = clean_str(id_col_name)
-
             member_names = {}
             member_past_overflow = {}
 
-            col_m1 = next((c for c in df_sched.columns if c == 'OF_M1'), None)
-            col_m2 = next((c for c in df_sched.columns if c == 'OF_M2'), None)
+            col_m1 = next((c for c in df_sched.columns if c.upper().strip() == 'OF_M1'), None)
+            col_m2 = next((c for c in df_sched.columns if c.upper().strip() == 'OF_M2'), None)
 
             for _, row in df_sched.iterrows():
-                m_id = clean_str(row[clean_id_col])
-                m_name = str(row[clean_str(name_col_name)]).strip() if pd.notna(row[clean_str(name_col_name)]) else m_id
+                m_id = clean_str(row[id_col_name])
+                m_name = str(row[name_col_name]).strip() if pd.notna(row[name_col_name]) else m_id
                 member_names[m_id] = m_name
 
                 of1 = parse_int_safely(row[col_m1]) if col_m1 else 0
                 of2 = parse_int_safely(row[col_m2]) if col_m2 else 0
                 member_past_overflow[m_id] = of1 + of2
 
-            df_initial_indexed = df_sched.set_index(clean_id_col)
+            df_initial_indexed = df_sched.set_index(id_col_name)
             
             existing_members = [m for m in members if m in df_initial_indexed.index]
             log(f"初期勤務表に存在する有効メンバー数: {len(existing_members)}名")
@@ -198,6 +264,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                 for p in existing_members:
                     model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
+            # --- 🔥 月初日（第1列）と月末日（最終列）の自動判定 ---
             first_date = dates[0] if dates else None
             last_date = dates[-1] if dates else None
 
@@ -205,7 +272,9 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                 for d in dates:
                     orig_t = initial_assignment.get((p, d), '公休')
                     
+                    # 🔥 月末日の泊まり1日目（翌月連動なし）の判定
                     is_last_day_pair_first = (d == last_date and orig_t in first_day_pair_tasks)
+                    # 🔥 月初日の泊まり2日目（前月連動なし）の判定
                     is_first_day_pair_second = (d == first_date and orig_t in second_day_pair_tasks)
 
                     if not is_trade_allowed(orig_t) or day_lock_flags.get(d, False) or is_last_day_pair_first or is_first_day_pair_second:
@@ -254,6 +323,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                     required_count = tasks_today.count(t)
                     model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
+            # --- 1対1ペアトレード限定制約（三つ巴・複数トレード禁止） ---
             for d in dates:
                 if day_lock_flags.get(d, False):
                     continue
@@ -265,6 +335,7 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
                         orig1 = initial_assignment.get((p1, d), '公休')
                         orig2 = initial_assignment.get((p2, d), '公休')
                         
+                        # 月初・月末の境界ペア保護判定
                         p1_boundary_pair = (d == last_date and orig1 in first_day_pair_tasks) or (d == first_date and orig1 in second_day_pair_tasks)
                         p2_boundary_pair = (d == last_date and orig2 in first_day_pair_tasks) or (d == first_date and orig2 in second_day_pair_tasks)
 
@@ -513,3 +584,158 @@ def run_optimization(df_members, df_tasks, df_initial_raw):
             log("❌ プログラム実行中に予期せぬエラーが発生しました:")
             log(err_msg)
             return df_initial_raw, False, f"Exception: {str(e)}", [], [], [], set(), set(), "", {}, debug_logs
+
+    st.subheader("2. 最適化計算の実行")
+    if st.button("シフト最適化の実行"):
+        if file_members and file_tasks and file_initial:
+            with st.spinner("計算中..."):
+                df_m = load_csv_safely(file_members)
+                df_t = load_csv_safely(file_tasks)
+                df_i = load_csv_safely(file_initial)
+                
+                result_df, success, log_msg, change_logs, pair_debug_logs, triple_logs, changed_cells, overflow_cells, id_col, day_lock_flags, debug_logs = run_optimization(df_m, df_t, df_i)
+                
+                if success:
+                    st.success("最適化計算が完了しました！")
+
+                    if triple_logs:
+                        st.subheader("🔥 優先適用された【3連番一括トレード】")
+                        for tlog in triple_logs:
+                            st.success(tlog)
+
+                    if change_logs:
+                        st.subheader("📋 変更（トレード）された勤務一覧")
+                        for clog in change_logs:
+                            st.write(clog)
+                    else:
+                        st.info("ℹ️ 初期シフトから変更の必要はありませんでした。（全ての勤務が自エリアと一致しています）")
+
+                    with st.expander("🔍 適用されたペア制約（2日連動）ログ"):
+                        for p_log in sorted(list(set(pair_debug_logs))):
+                            st.write(p_log)
+
+                    st.subheader("📊 最適化結果プレビュー")
+                    st.caption("※ **薄ピンク色の列**: LOCK（固定指定）された日")
+                    st.caption("※ **黄緑色のセル**: トレードにより変更された勤務")
+                    st.caption("※ **黄色のセル**: 溢れ（自エリアと不一致・かつトレード対象）が発生している勤務")
+                    st.caption("※ **赤文字のセル**: 週休・休暇・公休などの休日セル（白背景＋赤文字）")
+
+                    OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
+
+                    def highlight_schedule(df):
+                        style_df = pd.DataFrame('', index=df.index, columns=df.columns)
+                        
+                        for idx, row in df.iterrows():
+                            p_id = str(row[id_col])
+                            for col in df.columns:
+                                cell_val = str(row[col])
+                                str_col = str(col)
+                                is_locked = day_lock_flags.get(str_col, False)
+                                is_changed = (p_id, str_col) in changed_cells
+                                is_overflow = (p_id, str_col) in overflow_cells
+                                
+                                is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
+
+                                if is_off:
+                                    bg_color = '#f8d7da' if is_locked else '#ffffff'
+                                    style_df.loc[idx, col] = f'background-color: {bg_color}; color: #d9534f; font-weight: bold;'
+                                elif is_locked:
+                                    style_df.loc[idx, col] = 'background-color: #f8d7da; color: #721c24;'
+                                elif is_overflow:
+                                    style_df.loc[idx, col] = 'background-color: #fff3cd; color: #856404; font-weight: bold;'
+                                elif is_changed:
+                                    style_df.loc[idx, col] = 'background-color: #d4edda; color: #155724; font-weight: bold;'
+                                    
+                        return style_df
+
+                    styled_df = result_df.style.apply(highlight_schedule, axis=None)
+                    st.dataframe(styled_df)
+
+                    def generate_styled_html(df, id_col_name, day_lock_flags, changed_cells, overflow_cells):
+                        html = """
+                        <html>
+                        <head>
+                            <meta charset="utf-8">
+                            <style>
+                                body { font-family: 'Helvetica Neue', Arial, sans-serif; padding: 20px; }
+                                h2 { color: #333; }
+                                table { border-collapse: collapse; width: 100%; font-size: 11px; }
+                                th, td { border: 1px solid #ddd; padding: 6px; text-align: center; white-space: nowrap; }
+                                th { background-color: #f2f2f2; color: #333; }
+                            </style>
+                        </head>
+                        <body>
+                            <h2>勤務変更補助システム - 最適化結果</h2>
+                            <table>
+                                <thead>
+                                    <tr>
+                        """
+                        for col in df.columns:
+                            html += f"<th>{col}</th>"
+                        html += "</tr></thead><tbody>"
+
+                        for idx, row in df.iterrows():
+                            p_id = str(row[id_col_name])
+                            html += "<tr>"
+                            for col in df.columns:
+                                cell_val = str(row[col])
+                                str_col = str(col)
+                                is_locked = day_lock_flags.get(str_col, False)
+                                is_changed = (p_id, str_col) in changed_cells
+                                is_overflow = (p_id, str_col) in overflow_cells
+                                is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
+
+                                bg = "#ffffff"
+                                color = "#000000"
+                                weight = "normal"
+
+                                if is_off:
+                                    bg = "#f8d7da" if is_locked else "#ffffff"
+                                    color = "#d9534f"
+                                    weight = "bold"
+                                elif is_locked:
+                                    bg = "#f8d7da"
+                                    color = "#721c24"
+                                elif is_overflow:
+                                    bg = "#fff3cd"
+                                    color = "#856404"
+                                    weight = "bold"
+                                elif is_changed:
+                                    bg = "#d4edda"
+                                    color = "#155724"
+                                    weight = "bold"
+
+                                html += f'<td style="background-color: {bg}; color: {color}; font-weight: {weight};">{cell_val}</td>'
+                            html += "</tr>"
+                        html += "</tbody></table></body></html>"
+                        return html
+
+                    col_dl1, col_dl2 = st.columns(2)
+
+                    with col_dl1:
+                        csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
+                        st.download_button(
+                            label="📥 CSVファイルをダウンロード",
+                            data=csv_data,
+                            file_name="Optimized_Schedule.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+
+                    with col_dl2:
+                        html_data = generate_styled_html(result_df, id_col, day_lock_flags, changed_cells, overflow_cells)
+                        st.download_button(
+                            label="📄 色付きHTML（PDF保存用）をダウンロード",
+                            data=html_data.encode('utf-8-sig'),
+                            file_name="Optimized_Schedule.html",
+                            mime="text/html",
+                            use_container_width=True
+                        )
+
+                else:
+                    st.error(f"解が見つからなかったか、エラーが発生しました。（詳細: {log_msg}）")
+
+                with st.expander("🐛 実行・デバッグログ（トラブルシューティング用）", expanded=not success):
+                    st.code("\n".join(debug_logs), language="text")
+        else:
+            st.error("エラー: 3つのファイルをすべてアップロードしてください。")
