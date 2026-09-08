@@ -356,27 +356,44 @@ if check_password():
                                 objective_terms.append(triple_swap_var * -100000)
                                 triple_trade_vars.append((p1, p2, d1, d2, d3, (p1_t1, p1_t2, p1_t3), (p2_t1, p2_t2, p2_t3), triple_swap_var))
 
+            # --- 目的関数の最適化（溢れ数の平準化と公平性確保） ---
+            member_overflow_vars = {}
             for p in existing_members:
                 p_base_area = member_base_area.get(p, 'ANY')
-                past_of = member_past_overflow.get(p, 0)
+                p_of_terms = []
+                
+                if p_base_area != 'ANY':
+                    for d in dates:
+                        if day_lock_flags.get(d, False):
+                            continue
+                        for t in all_tasks:
+                            if not is_trade_allowed(t):
+                                continue
+                            t_area = get_task_area(t)
+                            if t_area != 'ANY' and t_area != p_base_area:
+                                p_of_terms.append(x[p, d, t])
+                
+                of_var = model.NewIntVar(0, len(dates), f'overflow_{p}')
+                model.Add(of_var == sum(p_of_terms))
+                member_overflow_vars[p] = of_var
 
+                past_of = member_past_overflow.get(p, 0)
+                weighted_penalty = 1000 + (past_of * 500)
+                objective_terms.append(of_var * weighted_penalty)
+
+            max_overflow_var = model.NewIntVar(0, len(dates), 'max_overflow')
+            for p in existing_members:
+                model.Add(max_overflow_var >= member_overflow_vars[p])
+            
+            objective_terms.append(max_overflow_var * 5000)
+
+            for p in existing_members:
                 for d in dates:
                     if day_lock_flags.get(d, False):
                         continue
-
                     orig_t = initial_assignment.get((p, d), '公休')
                     for t in all_tasks:
-                        if not is_trade_allowed(t):
-                            continue
-                        
-                        t_area = get_task_area(t)
-                        
-                        if p_base_area != 'ANY' and t_area == p_base_area:
-                            base_reward = -10000
-                            overflow_penalty_factor = -100 * past_of
-                            objective_terms.append(x[p, d, t] * (base_reward + overflow_penalty_factor))
-                        
-                        if t != orig_t:
+                        if is_trade_allowed(t) and t != orig_t:
                             objective_terms.append(x[p, d, t] * 1)
 
             model.Minimize(sum(objective_terms))
@@ -561,7 +578,6 @@ if check_password():
                 else:
                     st.error(f"解が見つからなかったか、エラーが発生しました。（詳細: {log_msg}）")
 
-                # エラーログ・実行ログの出力アコーディオン
                 with st.expander("🐛 実行・デバッグログ（トラブルシューティング用）", expanded=not success):
                     st.code("\n".join(debug_logs), language="text")
         else:
