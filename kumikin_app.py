@@ -131,7 +131,6 @@ if check_password():
             task_end_type = {}
             pair_rules = {}
 
-            # --- 🔥 Task_Master.csv から仕業属性・ StartType / EndType を抽出 ---
             if 'TaskID' in df_tasks.columns:
                 for _, row in df_tasks.iterrows():
                     t_id = clean_str(row['TaskID'])
@@ -305,6 +304,42 @@ if check_password():
                     required_count = tasks_today.count(t)
                     model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
 
+            # --- 🔥 1対1ペアトレード限定制約（三つ巴・複数トレード禁止） ---
+            # 各日において、あるメンバー p1 が元の勤務から変更された場合、
+            # かならず別の特定のメンバー p2 と完全に勤務を入れ替えている（互換）状態であることを強制する。
+            for d in dates:
+                if day_lock_flags.get(d, False):
+                    continue
+                
+                # 日ごとのメンバーペアでのトレード発生変数
+                pair_swaps = {}
+                for i in range(len(existing_members)):
+                    for j in range(i + 1, len(existing_members)):
+                        p1, p2 = existing_members[i], existing_members[j]
+                        orig1 = initial_assignment.get((p1, d), '公休')
+                        orig2 = initial_assignment.get((p2, d), '公休')
+                        
+                        if orig1 != orig2 and is_trade_allowed(orig1) and is_trade_allowed(orig2):
+                            s_var = model.NewBoolVar(f'pair_swap_{p1}_{p2}_{d}')
+                            # p1がp2の元勤務になり、かつp2がp1の元勤務になる場合
+                            model.AddMinEquality(s_var, [x[p1, d, orig2], x[p2, d, orig1]])
+                            pair_swaps[(p1, p2)] = s_var
+
+                for p in existing_members:
+                    orig_t = initial_assignment.get((p, d), '公休')
+                    if not is_trade_allowed(orig_t):
+                        continue
+                    
+                    # pが関与するペアスワップ変数のリスト
+                    p_swaps = []
+                    for (p1, p2), s_var in pair_swaps.items():
+                        if p == p1 or p == p2:
+                            p_swaps.append(s_var)
+                    
+                    # pが元の勤務から変更された(x[p, d, orig_t] == 0)場合、必ずどれか1つの1対1ペアスワップが成立していること
+                    # すなわち、(1 - x[p, d, orig_t]) == sum(p_swaps)
+                    model.Add(sum(p_swaps) == 1 - x[p, d, orig_t])
+
             for d_idx in range(len(dates) - 1):
                 d_curr = dates[d_idx]
                 d_next = dates[d_idx + 1]
@@ -366,8 +401,7 @@ if check_password():
                                 objective_terms.append(triple_swap_var * -100000)
                                 triple_trade_vars.append((p1, p2, d1, d2, d3, (p1_t1, p1_t2, p1_t3), (p2_t1, p2_t2, p2_t3), triple_swap_var))
 
-            # --- 🔥 遅退勤（LATE）➔ 翌日早出勤（EARLY）ソフトペナルティ ---
-            LATE_EARLY_PENALTY_WEIGHT = 20  # 軽微なペナルティ加算
+            LATE_EARLY_PENALTY_WEIGHT = 20
 
             for p in existing_members:
                 for d_idx in range(len(dates) - 1):
@@ -505,7 +539,6 @@ if check_password():
 
                 df_result = pd.DataFrame(result_rows)
 
-                # OF_M1, OF_M2 列を整数表記に明示的に変換する
                 for m_col in [col_m1, col_m2]:
                     if m_col and m_col in df_result.columns:
                         df_result[m_col] = df_result[m_col].apply(
@@ -524,7 +557,7 @@ if check_password():
                                 f"【ペア整合確認】{p_name}さん({p}): {d_curr}『{work_curr}』 ➔ {d_next}『{work_next}』(完全連動)"
                             )
                 
-                return df_result, True, "OK", change_logs, pair_applied_logs, triple_applied_logs, changed_cells, overflow_cells, id_col_name, day_lock_flags, debug_logs
+                return df_result, True, "OK", change_logs, pair_applied_logs, triple_applied_logs, changed_cells, overflow_cells, id_col, day_lock_flags, debug_logs
             else:
                 return df_initial_raw, False, f"Solver Status: {status_name}", [], [], [], set(), set(), "", {}, debug_logs
 
