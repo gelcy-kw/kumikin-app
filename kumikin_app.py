@@ -356,7 +356,6 @@ if check_password():
                                 objective_terms.append(triple_swap_var * -100000)
                                 triple_trade_vars.append((p1, p2, d1, d2, d3, (p1_t1, p1_t2, p1_t3), (p2_t1, p2_t2, p2_t3), triple_swap_var))
 
-            # --- 目的関数の最適化（溢れ数の平準化と公平性確保） ---
             member_overflow_vars = {}
             for p in existing_members:
                 p_base_area = member_base_area.get(p, 'ANY')
@@ -480,7 +479,7 @@ if check_password():
 
                 df_result = pd.DataFrame(result_rows)
 
-                # ★ OF_M1, OF_M2 列を整数表記（小数点なし）に明示的に変換する
+                # OF_M1, OF_M2 列を整数表記に明示的に変換する
                 for m_col in [col_m1, col_m2]:
                     if m_col and m_col in df_result.columns:
                         df_result[m_col] = df_result[m_col].apply(
@@ -575,13 +574,88 @@ if check_password():
                     styled_df = result_df.style.apply(highlight_schedule, axis=None)
                     st.dataframe(styled_df)
 
-                    csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        label="Optimized_Schedule.csv をダウンロード",
-                        data=csv_data,
-                        file_name="Optimized_Schedule.csv",
-                        mime="text/csv"
-                    )
+                    # --- 色付きHTML (PDF印刷用) の生成処理 ---
+                    def generate_styled_html(df, id_col_name, day_lock_flags, changed_cells, overflow_cells):
+                        html = """
+                        <html>
+                        <head>
+                            <meta charset="utf-8">
+                            <style>
+                                body { font-family: 'Helvetica Neue', Arial, sans-serif; padding: 20px; }
+                                h2 { color: #333; }
+                                table { border-collapse: collapse; width: 100%; font-size: 11px; }
+                                th, td { border: 1px solid #ddd; padding: 6px; text-align: center; white-space: nowrap; }
+                                th { background-color: #f2f2f2; color: #333; }
+                            </style>
+                        </head>
+                        <body>
+                            <h2>勤務変更補助システム - 最適化結果</h2>
+                            <table>
+                                <thead>
+                                    <tr>
+                        """
+                        for col in df.columns:
+                            html += f"<th>{col}</th>"
+                        html += "</tr></thead><tbody>"
+
+                        for idx, row in df.iterrows():
+                            p_id = str(row[id_col_name])
+                            html += "<tr>"
+                            for col in df.columns:
+                                cell_val = str(row[col])
+                                str_col = str(col)
+                                is_locked = day_lock_flags.get(str_col, False)
+                                is_changed = (p_id, str_col) in changed_cells
+                                is_overflow = (p_id, str_col) in overflow_cells
+                                is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
+
+                                bg = "#ffffff"
+                                color = "#000000"
+                                weight = "normal"
+
+                                if is_off:
+                                    bg = "#f8d7da" if is_locked else "#ffffff"
+                                    color = "#d9534f"
+                                    weight = "bold"
+                                elif is_locked:
+                                    bg = "#f8d7da"
+                                    color = "#721c24"
+                                elif is_overflow:
+                                    bg = "#fff3cd"
+                                    color = "#856404"
+                                    weight = "bold"
+                                elif is_changed:
+                                    bg = "#d4edda"
+                                    color = "#155724"
+                                    weight = "bold"
+
+                                html += f'<td style="background-color: {bg}; color: {color}; font-weight: {weight};">{cell_val}</td>'
+                            html += "</tr>"
+                        html += "</tbody></table></body></html>"
+                        return html
+
+                    col_dl1, col_dl2 = st.columns(2)
+
+                    with col_dl1:
+                        csv_data = result_df.to_csv(index=False).encode('utf-8-sig')
+                        st.download_button(
+                            label="📥 CSVファイルをダウンロード",
+                            data=csv_data,
+                            file_name="Optimized_Schedule.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+
+                    with col_dl2:
+                        html_data = generate_styled_html(result_df, id_col, day_lock_flags, changed_cells, overflow_cells)
+                        st.download_button(
+                            label="📄 色付きHTML（PDF保存用）をダウンロード",
+                            data=html_data.encode('utf-8-sig'),
+                            file_name="Optimized_Schedule.html",
+                            mime="text/html",
+                            use_container_width=True
+                        )
+
                 else:
                     st.error(f"解が見つからなかったか、エラーが発生しました。（詳細: {log_msg}）")
 
