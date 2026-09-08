@@ -40,12 +40,12 @@ def normalize_area_dynamic(val):
     s = clean_str(val)
     return s if s else 'ANY'
 
-def is_fixed_task(task_code):
+# 休日・公休・OFFなどの基本固定仕業判定
+def is_off_or_vacation(task_code):
     if not task_code:
         return True
-    if not task_code[0].isdigit():
-        return True
-    return False
+    OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
+    return any(kw in task_code for kw in OFF_KEYWORDS)
 
 if check_password():
     st.title("勤務変更補助システム")
@@ -96,10 +96,11 @@ if check_password():
         members = list(member_base_area.keys())
 
         # -------------------------------------------------------------
-        # 3. 仕業マスターの動的パース
+        # 3. 仕業マスターの動的パース (TradeAllowedの追加)
         # -------------------------------------------------------------
         task_area_map = {}
         task_female_allowed_map = {}
+        task_trade_allowed_map = {}
         pair_rules = {}
 
         if 'TaskID' in df_tasks.columns:
@@ -107,17 +108,24 @@ if check_password():
                 t_id = clean_str(row['TaskID'])
                 t_area = normalize_area_dynamic(row.get('TargetArea', ''))
                 f_allowed = clean_str(row.get('FemaleAllowed', 'Y'))
+                trade_allowed = clean_str(row.get('TradeAllowed', 'Y'))
                 pair_id = clean_str(row.get('PairTaskID', ''))
+
+                # デフォルトでTradeAllowed列がない場合はアルファベット有無で判定（後方互換）
+                if 'TradeAllowed' not in df_tasks.columns:
+                    if t_id and not t_id[0].isdigit():
+                        trade_allowed = 'N'
+                    else:
+                        trade_allowed = 'Y'
 
                 task_area_map[t_id] = t_area
                 task_female_allowed_map[t_id] = f_allowed
+                task_trade_allowed_map[t_id] = trade_allowed
 
                 m_match = re.match(r'^(\d+)([MC])$', t_id)
                 if m_match:
                     num_str = m_match.group(1)
                     role_char = m_match.group(2)
-                    task_area_map[t_id] = t_area
-                    task_female_allowed_map[t_id] = f_allowed
 
                     if pair_id and pair_id.isdigit():
                         prev_plain_id = f"{pair_id}{role_char}"
@@ -133,6 +141,7 @@ if check_password():
                     
                     task_area_map[plain_id] = t_area
                     task_female_allowed_map[plain_id] = f_allowed
+                    task_trade_allowed_map[plain_id] = trade_allowed
 
                     if pair_id and pair_id.isdigit():
                         prev_plain_id = f"{pair_id}{role_char}"
@@ -145,12 +154,22 @@ if check_password():
                 pair_rules[pair_id] = t_id
 
         def get_task_area(task_code):
-            if is_fixed_task(task_code):
+            if is_off_or_vacation(task_code):
                 return 'ANY'
             return task_area_map.get(task_code, 'ANY')
 
         def is_female_allowed(task_code):
             return task_female_allowed_map.get(task_code, 'Y') != 'N'
+
+        def is_trade_allowed(task_code):
+            if is_off_or_vacation(task_code):
+                return False
+            # Task_Masterに定義されていない仕業で、先頭が英字の場合はトレード不可
+            if task_code not in task_trade_allowed_map:
+                if task_code and not task_code[0].isdigit():
+                    return False
+                return True
+            return task_trade_allowed_map.get(task_code, 'Y') == 'Y'
 
         # -------------------------------------------------------------
         # 4. 初期勤務表データの整理
@@ -199,11 +218,13 @@ if check_password():
             for p in existing_members:
                 model.Add(sum(x[p, d, t] for t in all_tasks) == 1)
 
-        # 2. OFF・公休・休暇等の固定 ＆ LOCK日の全員固定
+        # 2. トレード不可仕業（OFF・公休・休暇・TradeAllowed=N） ＆ LOCK日の全員固定
         for p in existing_members:
             for d in dates:
                 orig_t = initial_assignment.get((p, d), '公休')
-                if is_fixed_task(orig_t) or day_lock_flags.get(d, False):
+                
+                # トレード不可、または LOCK日 の場合は固定
+                if not is_trade_allowed(orig_t) or day_lock_flags.get(d, False):
                     for t in all_tasks:
                         if t != orig_t:
                             model.Add(x[p, d, t] == 0)
@@ -216,7 +237,7 @@ if check_password():
                 if day_lock_flags.get(d, False):
                     continue
                 for t in all_tasks:
-                    if is_fixed_task(t):
+                    if not is_trade_allowed(t):
                         continue
                     if p_role == 'M' and t.endswith('C'):
                         model.Add(x[p, d, t] == 0)
@@ -231,7 +252,7 @@ if check_password():
                     if day_lock_flags.get(d, False):
                         continue
                     for t in all_tasks:
-                        if is_fixed_task(t):
+                        if not is_trade_allowed(t):
                             continue
                         if not is_female_allowed(t):
                             model.Add(x[p, d, t] == 0)
@@ -242,7 +263,7 @@ if check_password():
                 continue
             tasks_today = [initial_assignment.get((p, d), '公休') for p in existing_members]
             for t in all_tasks:
-                if is_fixed_task(t):
+                if not is_trade_allowed(t):
                     continue
                 required_count = tasks_today.count(t)
                 model.Add(sum(x[p, d, t] for p in existing_members) == required_count)
@@ -266,7 +287,7 @@ if check_password():
                         continue
                     orig_t = initial_assignment.get((p, d), '公休')
                     for t in all_tasks:
-                        if is_fixed_task(t) or t == orig_t:
+                        if not is_trade_allowed(t) or t == orig_t:
                             continue
                         t_area = get_task_area(t)
                         if t_area != 'ANY' and t_area != p_base_area:
@@ -285,7 +306,7 @@ if check_password():
 
                 orig_t = initial_assignment.get((p, d), '公休')
                 for t in all_tasks:
-                    if is_fixed_task(t):
+                    if not is_trade_allowed(t):
                         continue
                     
                     t_area = get_task_area(t)
@@ -404,10 +425,8 @@ if check_password():
                     st.caption("※ **黄色のセル**: 溢れ（自エリアと不一致）が発生している勤務")
                     st.caption("※ **赤文字のセル**: 週休・休暇・公休などの休日セル（白背景＋赤文字）")
 
-                    # 休日・休暇判定用キーワードリスト
-                    OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF']
+                    OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
 
-                    # スタイル適用関数（背景色：白背景＋赤太字）
                     def highlight_schedule(df):
                         style_df = pd.DataFrame('', index=df.index, columns=df.columns)
                         
@@ -420,12 +439,10 @@ if check_password():
                                 is_changed = (p_id, str_col) in changed_cells
                                 is_overflow = (p_id, str_col) in overflow_cells
                                 
-                                # 休日・休暇系の文字が含まれているか判定
                                 is_off = any(kw in cell_val for kw in OFF_KEYWORDS)
 
                                 # 1. 週休・休暇などは白背景＋赤文字太字
                                 if is_off:
-                                    # LOCK列の中にある場合でも背景はLOCK色を保ちつつ赤文字にするか、白背景＋赤文字にするか
                                     bg_color = '#f8d7da' if is_locked else '#ffffff'
                                     style_df.loc[idx, col] = f'background-color: {bg_color}; color: #d9534f; font-weight: bold;'
                                 # 2. LOCK指定の日（列全体を薄ピンクに）
