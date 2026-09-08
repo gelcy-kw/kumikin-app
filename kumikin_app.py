@@ -367,6 +367,7 @@ if check_password():
                         if day_lock_flags.get(d, False):
                             continue
                         for t in all_tasks:
+                            # TradeAllowedがNの仕業は溢れカウントから除外
                             if not is_trade_allowed(t):
                                 continue
                             t_area = get_task_area(t)
@@ -465,7 +466,8 @@ if check_password():
                         task_assigned = final_schedule.get((p, d), initial_assignment.get((p, d), '公休'))
                         row[d] = task_assigned
                         
-                        if not day_lock_flags.get(d, False):
+                        # LOCK日ではなく、かつトレード可能な仕業(is_trade_allowed)の場合のみ溢れ判定
+                        if not day_lock_flags.get(d, False) and is_trade_allowed(task_assigned):
                             t_area = get_task_area(task_assigned)
                             if p_base_area != 'ANY' and t_area != 'ANY' and p_base_area != t_area:
                                 overflow_count += 1
@@ -534,7 +536,7 @@ if check_password():
                     st.subheader("📊 最適化結果プレビュー")
                     st.caption("※ **薄ピンク色の列**: LOCK（固定指定）された日")
                     st.caption("※ **黄緑色のセル**: トレードにより変更された勤務")
-                    st.caption("※ **黄色のセル**: 溢れ（自エリアと不一致）が発生している勤務")
+                    st.caption("※ **黄色のセル**: 溢れ（自エリアと不一致・かつトレード対象）が発生している勤務")
                     st.caption("※ **赤文字のセル**: 週休・休暇・公休などの休日セル（白背景＋赤文字）")
 
                     OFF_KEYWORDS = ['週休', '休暇', '公休', '有休', '特休', '代休', 'OFF', '明']
